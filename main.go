@@ -1,0 +1,203 @@
+package main
+
+import (
+	"context"
+	"log"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+
+	"github.com/gofiber/fiber/v2"
+	"github.com/gofiber/fiber/v2/middleware/cors"
+	"github.com/gofiber/fiber/v2/middleware/logger"
+	"github.com/gofiber/fiber/v2/middleware/recover"
+	"github.com/joho/godotenv"
+
+	"github.com/topdee/backend/internal/channels"
+	"github.com/topdee/backend/internal/clients"
+	"github.com/topdee/backend/internal/config"
+	"github.com/topdee/backend/internal/db"
+	"github.com/topdee/backend/internal/handlers"
+	"github.com/topdee/backend/internal/middleware"
+)
+
+func main() {
+	_ = godotenv.Load()
+
+	cfg, err := config.Load()
+	if err != nil {
+		log.Fatalf("config: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	mongo, err := db.Connect(ctx, cfg.MongoURI, cfg.MongoDB)
+	if err != nil {
+		log.Fatalf("mongo connect: %v", err)
+	}
+	defer func() {
+		_ = mongo.Client.Disconnect(context.Background())
+	}()
+
+	aiClient := clients.NewAIClient(cfg.AIServiceURL)
+
+	orch := handlers.NewOrchestrator(mongo, aiClient, cfg)
+
+	// Channel provider registry — adding a new social platform is one
+	// `registry.Register(NewFooProvider())` line.
+	channelRegistry := channels.NewRegistry()
+	channelRegistry.Register(channels.NewFacebookProvider())
+	channelRegistry.Register(channels.NewLineProvider())
+	channelStore := channels.NewStore(mongo)
+
+	// One-time migration: copy any legacy tenants.facebook / tenants.line
+	// sub-documents into the new channel_connections collection. Idempotent.
+	{
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		fbN, lineN, errN := channels.MigrateLegacyTenantConnections(ctx, mongo)
+		cancel()
+		if fbN+lineN+errN > 0 {
+			log.Printf("channels: migrated %d facebook + %d line legacy connections (errors=%d)", fbN, lineN, errN)
+		}
+	}
+
+	app := fiber.New(fiber.Config{
+		AppName:      "topdee-backend",
+		BodyLimit:    25 * 1024 * 1024, // 25MB to allow PDF uploads
+		ErrorHandler: handlers.ErrorHandler,
+	})
+	app.Use(recover.New())
+	app.Use(logger.New())
+	app.Use(cors.New(cors.Config{
+		AllowOrigins: "*",
+		AllowHeaders: "Origin, Content-Type, Accept, Authorization",
+	}))
+
+	// public
+	app.Get("/health", handlers.Health(mongo, aiClient))
+
+	api := app.Group("/api/v1")
+
+	// auth routes (public)
+	authH := handlers.NewAuthHandler(mongo, cfg)
+	api.Post("/auth/register", authH.Register)
+	api.Post("/auth/login", authH.Login)
+
+	// Public accept-invite — exchanges a token for a new user + JWT.
+	teamH := handlers.NewTeamHandler(mongo, cfg)
+	api.Post("/auth/accept-invite", teamH.AcceptInvite)
+
+	// Auth-gated routes. Once `api.Use(RequireAuth)` runs, every subsequent
+	// route on this group inherits the JWT check.
+	protected := api.Use(middleware.RequireAuth(cfg))
+
+	// Platform admin routes (Topdee staff). Inherit RequireAuth from the
+	// chain above; we only add the admin guard here.
+	adminH := handlers.NewAdminHandler(mongo)
+	protected.Get("/admin/metrics", middleware.RequireAdmin(), adminH.Metrics)
+	protected.Get("/admin/tenants", middleware.RequireAdmin(), adminH.ListTenants)
+	protected.Get("/admin/tenants/:id", middleware.RequireAdmin(), adminH.GetTenant)
+	protected.Patch("/admin/tenants/:id", middleware.RequireAdmin(), adminH.UpdateTenant)
+	protected.Patch("/admin/tenants/:id/subscription", middleware.RequireAdmin(), adminH.UpdateSubscription)
+	protected.Post("/admin/tenants/:id/subscription/extend", middleware.RequireAdmin(), adminH.ExtendSubscription)
+	protected.Delete("/admin/tenants/:id", middleware.RequireAdmin(), adminH.DeleteTenant)
+	protected.Get("/admin/users", middleware.RequireAdmin(), adminH.ListUsers)
+	protected.Patch("/admin/users/:id", middleware.RequireAdmin(), adminH.UpdateUser)
+	protected.Delete("/admin/users/:id", middleware.RequireAdmin(), adminH.DeleteUser)
+
+	// Knowledge bases
+	kbH := handlers.NewKnowledgeHandler(mongo, aiClient)
+	protected.Get("/knowledge", kbH.List)
+	protected.Post("/knowledge", kbH.Create)
+	protected.Get("/knowledge/:id", kbH.Get)
+	protected.Delete("/knowledge/:id", kbH.Delete)
+	protected.Post("/knowledge/:id/files", kbH.UploadFile)
+
+	// Bot settings (per-tenant override of the platform agent)
+	botH := handlers.NewBotHandler(mongo, cfg)
+	protected.Get("/bot", botH.Get)
+	protected.Put("/bot", botH.Update)
+
+	// Team — members + invites. Anyone in the workspace can list members,
+	// but write operations are gated to owner/admin via RequireRole.
+	manage := middleware.RequireRole("owner", "admin")
+	protected.Get("/team/members", teamH.ListMembers)
+	protected.Patch("/team/members/:id", middleware.RequireRole("owner"), teamH.UpdateMemberRole)
+	protected.Delete("/team/members/:id", manage, teamH.RemoveMember)
+	protected.Get("/team/invites", manage, teamH.ListInvites)
+	protected.Post("/team/invites", manage, teamH.CreateInvite)
+	protected.Delete("/team/invites/:id", manage, teamH.RevokeInvite)
+	protected.Post("/team/invites/:id/resend", manage, teamH.ResendInvite)
+
+	// Business hours (drives "Are we open right now?" hint into the AI prompt)
+	bhH := handlers.NewBusinessHoursHandler(mongo)
+	protected.Get("/business-hours", bhH.Get)
+	protected.Put("/business-hours", bhH.Update)
+
+	// Channel connections — generic, multi-account per provider.
+	chH := handlers.NewChannelsHandler(mongo, cfg)
+	protected.Get("/channels", chH.List)
+	protected.Get("/channels/webhook-url-template", chH.WebhookURLTemplate)
+	protected.Delete("/channels/:id", chH.Disconnect)
+	// LINE: manual paste-in (no OAuth on LINE).
+	protected.Put("/channels/line", chH.ConnectLine)
+	// Facebook: OAuth login flow → page picker → connect selected pages.
+	protected.Post("/channels/facebook/oauth/start", chH.FacebookOAuthStart)
+	protected.Get("/channels/facebook/oauth/pages", chH.FacebookOAuthPages)
+	protected.Post("/channels/facebook/oauth/connect", chH.FacebookOAuthConnect)
+
+	// Playground (in-dashboard test chat)
+	pgH := handlers.NewPlaygroundHandler(orch, mongo)
+	protected.Post("/playground/chat", pgH.Send)
+	protected.Get("/playground/conversations", pgH.ListConversations)
+	protected.Get("/playground/conversations/:id", pgH.GetConversation)
+
+	// Inbox — real customer conversations from LINE / Facebook / etc.
+	// (Playground messages are excluded server-side.) The handler needs
+	// the channel registry + store too so it can dispatch outbound
+	// human-agent replies through the right provider's push API.
+	inboxH := handlers.NewInboxHandler(mongo, channelRegistry, channelStore)
+	protected.Get("/inbox/conversations", inboxH.ListConversations)
+	protected.Get("/inbox/conversations/:id/messages", inboxH.GetMessages)
+	protected.Post("/inbox/conversations/:id/messages", inboxH.SendMessage)
+
+	// Stripe billing — tenant-scoped self-service.
+	billingH := handlers.NewBillingHandler(mongo, cfg)
+	protected.Post("/billing/checkout-session", billingH.CreateCheckoutSession)
+	protected.Post("/billing/portal-session", billingH.CreatePortalSession)
+
+	// Public webhooks (secured by signature verification). The generic
+	// /webhooks/:provider route covers every social platform via the
+	// registry; Stripe and the Facebook OAuth callback get explicit
+	// routes since they don't fit the per-provider Provider interface.
+	webhooks := app.Group("/webhooks")
+	webhooks.Get("/facebook/oauth/callback", handlers.FacebookOAuthCallback(channelStore, mongo, cfg))
+	webhooks.Post("/stripe", handlers.StripeWebhook(mongo, cfg))
+	// Generic provider webhooks. Two URL shapes are supported:
+	//   /webhooks/<provider>                 — uses the body to find the
+	//                                          right connection (Facebook).
+	//   /webhooks/<provider>/<external_id>   — per-connection URL pasted
+	//                                          into the customer's console
+	//                                          (LINE channel_id, etc.).
+	webhookHandler := handlers.WebhookHandler(channelRegistry, channelStore, mongo, orch, cfg)
+	webhooks.Get("/:provider", webhookHandler)
+	webhooks.Post("/:provider", webhookHandler)
+	webhooks.Get("/:provider/:external_id", webhookHandler)
+	webhooks.Post("/:provider/:external_id", webhookHandler)
+
+	// graceful shutdown
+	go func() {
+		log.Printf("listening on :%s", cfg.Port)
+		if err := app.Listen(":" + cfg.Port); err != nil {
+			log.Fatalf("listen: %v", err)
+		}
+	}()
+
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	<-quit
+	log.Println("shutting down")
+	_ = app.ShutdownWithTimeout(5 * time.Second)
+}

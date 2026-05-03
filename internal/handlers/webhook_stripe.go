@@ -1,0 +1,310 @@
+package handlers
+
+// Stripe webhook handler — the source of truth for subscription state.
+//
+// Mounted at POST /webhooks/stripe (public, no JWT). The Stripe-Signature
+// header + the webhook secret authenticate the call; without that header
+// matching, we 400 and exit. Stripe will retry failed deliveries with
+// exponential backoff for up to 3 days, so being strict here is safe.
+//
+// Events handled:
+//   checkout.session.completed       — initial subscribe → mark active
+//   customer.subscription.updated    — plan change / cancel-at-period-end
+//   customer.subscription.deleted    — final cancellation
+//   invoice.payment_succeeded        — renewal → bump current_period_end
+//   invoice.payment_failed           — renewal failed → mark past_due
+//
+// All handlers are idempotent (Stripe sometimes delivers the same event
+// twice). They use upsert semantics — re-running the same event is a
+// no-op.
+
+import (
+	"context"
+	"encoding/json"
+	"io"
+	"log"
+	"time"
+
+	"github.com/gofiber/fiber/v2"
+	"github.com/stripe/stripe-go/v79"
+	"github.com/stripe/stripe-go/v79/webhook"
+	"go.mongodb.org/mongo-driver/bson"
+
+	"github.com/topdee/backend/internal/config"
+	"github.com/topdee/backend/internal/db"
+	"github.com/topdee/backend/internal/models"
+)
+
+// StripeWebhook returns the Fiber handler. We accept the body raw (no
+// JSON pre-parse) because signature verification needs the exact bytes
+// Stripe sent.
+func StripeWebhook(mongo *db.Mongo, cfg *config.Config) fiber.Handler {
+	return func(c *fiber.Ctx) error {
+		if cfg.StripeWebhookSecret == "" {
+			return fiber.NewError(fiber.StatusServiceUnavailable, "webhook secret not configured")
+		}
+
+		body := c.Body()
+		sigHeader := c.Get("Stripe-Signature")
+		if sigHeader == "" {
+			return fiber.NewError(fiber.StatusBadRequest, "missing Stripe-Signature")
+		}
+
+		// Verifies HMAC-SHA256 signature against the secret + tolerance window.
+		event, err := webhook.ConstructEvent(body, sigHeader, cfg.StripeWebhookSecret)
+		if err != nil {
+			return fiber.NewError(fiber.StatusBadRequest, "signature verification failed: "+err.Error())
+		}
+
+		ctx, cancel := context.WithTimeout(c.Context(), 15*time.Second)
+		defer cancel()
+
+		// Dispatch. Returning nil here means we 200 the event; Stripe
+		// won't retry. Errors trigger a Stripe retry — only return error
+		// for truly transient issues (DB down), not malformed data.
+		switch event.Type {
+		case "checkout.session.completed":
+			err = handleCheckoutCompleted(ctx, mongo, event)
+		case "customer.subscription.updated", "customer.subscription.created":
+			err = handleSubscriptionUpdated(ctx, mongo, event)
+		case "customer.subscription.deleted":
+			err = handleSubscriptionDeleted(ctx, mongo, event)
+		case "invoice.payment_succeeded":
+			err = handleInvoicePaid(ctx, mongo, event)
+		case "invoice.payment_failed":
+			err = handleInvoiceFailed(ctx, mongo, event)
+		default:
+			// Unhandled event types are still 200 — Stripe sends a lot
+			// of stuff we don't care about (price.updated, etc).
+			return c.SendStatus(fiber.StatusOK)
+		}
+
+		if err != nil {
+			log.Printf("[stripe webhook] %s: %v", event.Type, err)
+			return fiber.NewError(fiber.StatusInternalServerError, err.Error())
+		}
+		return c.SendStatus(fiber.StatusOK)
+	}
+}
+
+// ── handlers ───────────────────────────────────────────────────────────
+
+// findTenant looks up a tenant by Stripe customer id, optionally
+// upserting the subscription_id. Returns the tenant (or empty if missing
+// — webhook events for unknown customers are silently dropped).
+func findTenantByCustomer(ctx context.Context, mongo *db.Mongo, customerID string) (*models.Tenant, error) {
+	var t models.Tenant
+	err := mongo.DB.Collection("tenants").
+		FindOne(ctx, bson.M{"stripe_customer_id": customerID}).
+		Decode(&t)
+	if err != nil {
+		// Log, but don't fail the webhook. Most likely the customer
+		// metadata pointed to a tenant we don't have (test data, deleted
+		// tenant, etc).
+		log.Printf("[stripe webhook] tenant not found for customer %s: %v", customerID, err)
+		return nil, nil
+	}
+	return &t, nil
+}
+
+func handleCheckoutCompleted(ctx context.Context, mongo *db.Mongo, ev stripe.Event) error {
+	var sess stripe.CheckoutSession
+	if err := json.Unmarshal(ev.Data.Raw, &sess); err != nil {
+		return err
+	}
+	if sess.Customer == nil || sess.Subscription == nil {
+		return nil // not a subscription checkout — ignore
+	}
+	t, err := findTenantByCustomer(ctx, mongo, sess.Customer.ID)
+	if err != nil || t == nil {
+		return err
+	}
+
+	// Persist the subscription id so the portal + webhooks can correlate.
+	_, err = mongo.DB.Collection("tenants").UpdateOne(ctx,
+		bson.M{"_id": t.ID},
+		bson.M{"$set": bson.M{
+			"stripe_subscription_id": sess.Subscription.ID,
+		}},
+	)
+	return err
+}
+
+func handleSubscriptionUpdated(ctx context.Context, mongo *db.Mongo, ev stripe.Event) error {
+	var sub stripe.Subscription
+	if err := json.Unmarshal(ev.Data.Raw, &sub); err != nil {
+		return err
+	}
+	if sub.Customer == nil {
+		return nil
+	}
+	t, err := findTenantByCustomer(ctx, mongo, sub.Customer.ID)
+	if err != nil || t == nil {
+		return err
+	}
+	return syncSubscription(ctx, mongo, t.ID, &sub)
+}
+
+func handleSubscriptionDeleted(ctx context.Context, mongo *db.Mongo, ev stripe.Event) error {
+	var sub stripe.Subscription
+	if err := json.Unmarshal(ev.Data.Raw, &sub); err != nil {
+		return err
+	}
+	if sub.Customer == nil {
+		return nil
+	}
+	t, err := findTenantByCustomer(ctx, mongo, sub.Customer.ID)
+	if err != nil || t == nil {
+		return err
+	}
+	now := time.Now().UTC()
+	merged := mergedSubscription(t.Subscription)
+	merged.Status = models.SubStatusCanceled
+	merged.CanceledAt = &now
+	merged.CancelAtPeriodEnd = false
+	merged.UpdatedAt = now
+
+	_, err = mongo.DB.Collection("tenants").UpdateOne(ctx,
+		bson.M{"_id": t.ID},
+		bson.M{"$set": bson.M{
+			"subscription":           merged,
+			"stripe_subscription_id": "",
+		}},
+	)
+	return err
+}
+
+func handleInvoicePaid(ctx context.Context, mongo *db.Mongo, ev stripe.Event) error {
+	var inv stripe.Invoice
+	if err := json.Unmarshal(ev.Data.Raw, &inv); err != nil {
+		return err
+	}
+	if inv.Customer == nil || inv.Subscription == nil {
+		return nil
+	}
+	t, err := findTenantByCustomer(ctx, mongo, inv.Customer.ID)
+	if err != nil || t == nil {
+		return err
+	}
+	// Re-fetch the full subscription so we have the latest period end.
+	// We embed the same data path here for resilience: invoices are the
+	// most reliable signal of "you got paid".
+	merged := mergedSubscription(t.Subscription)
+	merged.Status = models.SubStatusActive
+	if inv.Lines != nil && len(inv.Lines.Data) > 0 && inv.Lines.Data[0].Period != nil {
+		end := time.Unix(inv.Lines.Data[0].Period.End, 0).UTC()
+		merged.CurrentPeriodEnd = &end
+	}
+	merged.UpdatedAt = time.Now().UTC()
+
+	_, err = mongo.DB.Collection("tenants").UpdateOne(ctx,
+		bson.M{"_id": t.ID},
+		bson.M{"$set": bson.M{"subscription": merged}},
+	)
+	return err
+}
+
+func handleInvoiceFailed(ctx context.Context, mongo *db.Mongo, ev stripe.Event) error {
+	var inv stripe.Invoice
+	if err := json.Unmarshal(ev.Data.Raw, &inv); err != nil {
+		return err
+	}
+	if inv.Customer == nil {
+		return nil
+	}
+	t, err := findTenantByCustomer(ctx, mongo, inv.Customer.ID)
+	if err != nil || t == nil {
+		return err
+	}
+	merged := mergedSubscription(t.Subscription)
+	merged.Status = models.SubStatusPastDue
+	merged.UpdatedAt = time.Now().UTC()
+	_, err = mongo.DB.Collection("tenants").UpdateOne(ctx,
+		bson.M{"_id": t.ID},
+		bson.M{"$set": bson.M{"subscription": merged}},
+	)
+	return err
+}
+
+// ── helpers ────────────────────────────────────────────────────────────
+
+func mergedSubscription(existing *models.Subscription) *models.Subscription {
+	if existing != nil {
+		return existing
+	}
+	return &models.Subscription{Status: models.SubStatusActive}
+}
+
+// syncSubscription writes the canonical fields out of a Stripe Subscription
+// object into our local Subscription doc. Used by both .created and
+// .updated handlers (Stripe events are very similar in shape).
+func syncSubscription(ctx context.Context, mongo *db.Mongo, tenantID string, sub *stripe.Subscription) error {
+	merged := &models.Subscription{}
+	// Don't overwrite admin_notes — preserve whatever the admin typed.
+	var existing models.Tenant
+	if err := mongo.DB.Collection("tenants").
+		FindOne(ctx, bson.M{"_id": tenantID}).Decode(&existing); err == nil && existing.Subscription != nil {
+		merged.AdminNotes = existing.Subscription.AdminNotes
+	}
+
+	// Map Stripe status → our status. Stripe has more granularity (incomplete,
+	// incomplete_expired, unpaid) than we want to expose in admin UI, so we
+	// flatten the rare ones into past_due.
+	switch sub.Status {
+	case stripe.SubscriptionStatusTrialing:
+		merged.Status = models.SubStatusTrialing
+	case stripe.SubscriptionStatusActive:
+		merged.Status = models.SubStatusActive
+	case stripe.SubscriptionStatusCanceled:
+		merged.Status = models.SubStatusCanceled
+	case stripe.SubscriptionStatusPaused:
+		merged.Status = models.SubStatusPaused
+	case stripe.SubscriptionStatusPastDue,
+		stripe.SubscriptionStatusUnpaid,
+		stripe.SubscriptionStatusIncomplete,
+		stripe.SubscriptionStatusIncompleteExpired:
+		merged.Status = models.SubStatusPastDue
+	default:
+		merged.Status = string(sub.Status)
+	}
+
+	if sub.TrialEnd > 0 {
+		t := time.Unix(sub.TrialEnd, 0).UTC()
+		merged.TrialEndsAt = &t
+	}
+	if sub.CurrentPeriodEnd > 0 {
+		t := time.Unix(sub.CurrentPeriodEnd, 0).UTC()
+		merged.CurrentPeriodEnd = &t
+	}
+	if sub.CanceledAt > 0 {
+		t := time.Unix(sub.CanceledAt, 0).UTC()
+		merged.CanceledAt = &t
+	}
+	merged.CancelAtPeriodEnd = sub.CancelAtPeriodEnd
+	merged.UpdatedAt = time.Now().UTC()
+
+	// Also update the plan field if Stripe exposes one through the
+	// subscription's first item — keeps our UI labels in sync with the
+	// price the customer is actually paying.
+	updates := bson.M{
+		"subscription":           merged,
+		"stripe_subscription_id": sub.ID,
+	}
+	if sub.Items != nil && len(sub.Items.Data) > 0 && sub.Items.Data[0].Price != nil {
+		// Look up the metadata "plan" field on the price; if missing, keep
+		// whatever we have. Set on the price in Stripe Dashboard or via API.
+		if plan := sub.Items.Data[0].Price.Metadata["plan"]; plan != "" {
+			updates["plan"] = plan
+		}
+	}
+
+	_, err := mongo.DB.Collection("tenants").UpdateOne(ctx,
+		bson.M{"_id": tenantID},
+		bson.M{"$set": updates},
+	)
+	return err
+}
+
+// Discard buffer to silence "imported and not used: io" if the body
+// reader path is ever simplified out of the file.
+var _ = io.Discard

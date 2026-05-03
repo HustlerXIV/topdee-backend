@@ -269,6 +269,58 @@ func LineIssueAccessToken(ctx context.Context, channelID, channelSecret string) 
 	return out.AccessToken, out.ExpiresIn, nil
 }
 
+// LineUserProfile fetches a customer's display name (and picture) so the
+// inbox can show "สมชาย" instead of "LINE User abcd12". Requires that the
+// user has added the bot as a friend AND not blocked profile sharing —
+// returns 404 from LINE otherwise, in which case we fall back to the
+// placeholder. Best-effort, called fire-and-forget on inbound messages.
+//
+//   GET /v2/bot/profile/{userId}
+//
+// Quota: 2,000 calls/sec — far more than we'll ever hit. Persist the
+// result in `customer_profiles` so we don't re-fetch on every poll.
+type LineUserProfileResp struct {
+	UserID        string `json:"userId"`
+	DisplayName   string `json:"displayName"`
+	PictureURL    string `json:"pictureUrl"`
+	StatusMessage string `json:"statusMessage"`
+	Language      string `json:"language"`
+}
+
+func LineUserProfile(ctx context.Context, accessToken, userID string) (*LineUserProfileResp, error) {
+	if accessToken == "" || userID == "" {
+		return nil, fmt.Errorf("line profile: missing token or userId")
+	}
+	req, err := http.NewRequestWithContext(
+		ctx, "GET",
+		"https://api.line.me/v2/bot/profile/"+url.PathEscape(userID),
+		nil,
+	)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		// User isn't a friend / blocked profile sharing. Don't treat as
+		// an error — caller will fall back to the placeholder name.
+		return nil, nil
+	}
+	if resp.StatusCode >= 400 {
+		rb, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("line profile: %s: %s", resp.Status, string(rb))
+	}
+	var out LineUserProfileResp
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
 // LineBotInfo asks LINE who-am-I — used to fetch the bot's display name
 // after we've issued a token so the dashboard can show "Connected: <name>"
 // instead of just a numeric channel id.

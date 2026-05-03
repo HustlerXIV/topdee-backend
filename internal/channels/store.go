@@ -20,6 +20,7 @@ import (
 const (
 	connectionsColl = "channel_connections"
 	oauthStatesColl = "channel_oauth_states"
+	profilesColl    = "customer_profiles"
 )
 
 // ErrConnectionTaken is returned when the (provider, external_id) pair is
@@ -241,5 +242,46 @@ func (s *Store) GetOAuthState(ctx context.Context, state string) (*models.Facebo
 // DeleteOAuthState consumes a state record once we're done with it.
 func (s *Store) DeleteOAuthState(ctx context.Context, state string) error {
 	_, err := s.mongo.DB.Collection(oauthStatesColl).DeleteOne(ctx, bson.M{"_id": state})
+	return err
+}
+
+// ── Customer profile cache ──────────────────────────────────────────────
+
+// profileID is the deterministic _id we use for CustomerProfile docs:
+// "<provider>:<external_user_id>". Globally unique per platform.
+func profileID(provider, externalUserID string) string {
+	return provider + ":" + externalUserID
+}
+
+// GetProfile returns the cached display name / picture for a customer,
+// or nil when none has been fetched yet.
+func (s *Store) GetProfile(ctx context.Context, provider, externalUserID string) (*models.CustomerProfile, error) {
+	var p models.CustomerProfile
+	err := s.mongo.DB.Collection(profilesColl).
+		FindOne(ctx, bson.M{"_id": profileID(provider, externalUserID)}).
+		Decode(&p)
+	if err == mongo.ErrNoDocuments {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &p, nil
+}
+
+// UpsertProfile saves (or refreshes) the cached profile for a customer.
+// Best-effort callers can ignore the returned error.
+func (s *Store) UpsertProfile(ctx context.Context, p *models.CustomerProfile) error {
+	if p.Provider == "" || p.ExternalUserID == "" {
+		return errors.New("profile: missing provider or external_user_id")
+	}
+	p.ID = profileID(p.Provider, p.ExternalUserID)
+	p.UpdatedAt = time.Now().UTC()
+	_, err := s.mongo.DB.Collection(profilesColl).UpdateOne(
+		ctx,
+		bson.M{"_id": p.ID},
+		bson.M{"$set": p},
+		options.Update().SetUpsert(true),
+	)
 	return err
 }

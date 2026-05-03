@@ -13,6 +13,7 @@ package handlers
 //          persisted as role="human"
 
 import (
+	"context"
 	"log"
 	"strings"
 	"time"
@@ -36,6 +37,21 @@ type InboxHandler struct {
 
 func NewInboxHandler(m *db.Mongo, reg *channels.Registry, store *channels.Store) *InboxHandler {
 	return &InboxHandler{mongo: m, registry: reg, store: store}
+}
+
+// resolveCustomerName uses the cached profile when available, otherwise
+// falls back to the placeholder ("LINE User abcd12"). One Mongo round-trip
+// per conversation — cheap given the inbox cap of 200 rows.
+func (h *InboxHandler) resolveCustomerName(ctx context.Context, channel, externalUserID string) string {
+	if externalUserID == "" {
+		return "Unknown"
+	}
+	if h.store != nil {
+		if p, _ := h.store.GetProfile(ctx, channel, externalUserID); p != nil && p.DisplayName != "" {
+			return p.DisplayName
+		}
+	}
+	return customerNameFor(channel, externalUserID)
 }
 
 // inboxConversationView — one row in the inbox list. Computed from the
@@ -127,7 +143,7 @@ func (h *InboxHandler) ListConversations(c *fiber.Ctx) error {
 			ID:             r.ID,
 			Channel:        r.Channel,
 			ExternalUserID: uid,
-			CustomerName:   customerNameFor(r.Channel, uid),
+			CustomerName:   h.resolveCustomerName(c.Context(), r.Channel, uid),
 			Preview:        truncatePreview(r.Preview, 80),
 			LastMessageAt:  r.LastMessageAt,
 			LastSenderRole: r.LastSenderRole,

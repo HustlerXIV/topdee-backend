@@ -158,6 +158,12 @@ func processEvents(
 				log.Printf("webhook %s: orchestrator: %v", p.Name(), err)
 				continue
 			}
+
+			// Backfill the customer's display name. Fire-and-forget — the
+			// inbox can render with the placeholder if the profile API is
+			// slow or returns 404 (user hasn't friended the bot, etc.).
+			go cacheCustomerProfile(p, store, conn, evt)
+
 			if strings.TrimSpace(reply) == "" {
 				continue
 			}
@@ -240,4 +246,53 @@ func firstNonEmpty(a, b string) string {
 		return a
 	}
 	return b
+}
+
+// cacheCustomerProfile fetches a customer's display name from the platform
+// (LINE only for now — Meta tightly restricts profile access on Messenger
+// and most page-scoped IDs return nothing useful) and caches it. Idempotent;
+// safe to call on every inbound message — the caller decides how often.
+//
+// Best-effort: any error is logged and swallowed. The inbox falls back to
+// "LINE User abcd12" when no profile is cached.
+func cacheCustomerProfile(p channels.Provider, store *channels.Store, conn *models.ChannelConnection, evt channels.ParsedEvent) {
+	if evt.ExternalUserID == "" {
+		return
+	}
+	// Only LINE for now. Add per-provider profile fetchers here as we
+	// build them out.
+	if p.Name() != models.ProviderLine {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	// Skip the network round-trip if we already have a profile that's
+	// less than 7 days old.
+	if existing, _ := store.GetProfile(ctx, p.Name(), evt.ExternalUserID); existing != nil {
+		if time.Since(existing.UpdatedAt) < 7*24*time.Hour {
+			return
+		}
+	}
+
+	token := conn.Credentials["channel_access_token"]
+	if token == "" {
+		return
+	}
+	resp, err := channels.LineUserProfile(ctx, token, evt.ExternalUserID)
+	if err != nil {
+		log.Printf("inbox: LINE profile fetch: %v", err)
+		return
+	}
+	if resp == nil || resp.DisplayName == "" {
+		// User isn't a friend / blocked profile sharing — nothing to cache.
+		return
+	}
+	_ = store.UpsertProfile(ctx, &models.CustomerProfile{
+		Provider:       p.Name(),
+		ExternalUserID: evt.ExternalUserID,
+		DisplayName:    resp.DisplayName,
+		PictureURL:     resp.PictureURL,
+		Language:       resp.Language,
+	})
 }

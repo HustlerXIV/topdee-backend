@@ -14,7 +14,10 @@ package handlers
 
 import (
 	"context"
+	"io"
 	"log"
+	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -157,7 +160,7 @@ func (h *InboxHandler) ListConversations(c *fiber.Ctx) error {
 // to a sensible cap so the dashboard isn't overwhelmed by long histories.
 func (h *InboxHandler) GetMessages(c *fiber.Ctx) error {
 	tid := middleware.TenantID(c)
-	convID := c.Params("id")
+	convID := conversationIDParam(c)
 	if convID == "" {
 		return fiber.NewError(fiber.StatusBadRequest, "missing conversation id")
 	}
@@ -208,7 +211,7 @@ type sendMessageReq struct {
 func (h *InboxHandler) SendMessage(c *fiber.Ctx) error {
 	tid := middleware.TenantID(c)
 	uid := middleware.UserID(c)
-	convID := c.Params("id")
+	convID := conversationIDParam(c)
 	if convID == "" {
 		return fiber.NewError(fiber.StatusBadRequest, "missing conversation id")
 	}
@@ -284,7 +287,91 @@ func (h *InboxHandler) SendMessage(c *fiber.Ctx) error {
 	return c.JSON(msg)
 }
 
+// GetMedia proxies private provider media (currently LINE message content)
+// so the authenticated dashboard can display images in the inbox.
+func (h *InboxHandler) GetMedia(c *fiber.Ctx) error {
+	tid := middleware.TenantID(c)
+	mediaID := c.Params("id")
+	if decoded, err := url.PathUnescape(mediaID); err == nil {
+		mediaID = decoded
+	}
+	if mediaID == "" {
+		return fiber.NewError(fiber.StatusBadRequest, "missing media id")
+	}
+
+	var msg models.Message
+	if err := h.mongo.DB.Collection("messages").FindOne(
+		c.Context(),
+		bson.M{"tenant_id": tid, "attachments.id": mediaID},
+	).Decode(&msg); err != nil {
+		return fiber.NewError(fiber.StatusNotFound, "media not found")
+	}
+
+	providerName, externalChannelID, _, ok := parseConversationID(msg.ConversationID)
+	if !ok || providerName != models.ProviderLine {
+		return fiber.NewError(fiber.StatusBadRequest, "unsupported media provider")
+	}
+
+	conn, err := h.store.FindByExternal(c.Context(), providerName, externalChannelID)
+	if err != nil {
+		return err
+	}
+	if conn == nil || conn.TenantID != tid {
+		return fiber.NewError(fiber.StatusNotFound, "channel connection not found")
+	}
+	if provider, ok := h.registry.Get(providerName); ok {
+		if r, ok := provider.(channels.CredentialRefresher); ok {
+			if refreshed, err := r.EnsureCredentials(c.Context(), conn); err != nil {
+				return fiber.NewError(fiber.StatusBadGateway, "could not refresh credentials: "+err.Error())
+			} else if refreshed {
+				if err := h.store.UpdateCredentials(c.Context(), conn.ID, conn.Credentials); err != nil {
+					log.Printf("inbox media: persist refreshed credentials: %v", err)
+				}
+			}
+		}
+	}
+
+	token := conn.Credentials["channel_access_token"]
+	if token == "" {
+		return fiber.NewError(fiber.StatusBadGateway, "line media: no access token")
+	}
+	req, err := http.NewRequestWithContext(
+		c.Context(),
+		http.MethodGet,
+		"https://api-data.line.me/v2/bot/message/"+url.PathEscape(mediaID)+"/content",
+		nil,
+	)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode >= 400 {
+		return fiber.NewError(fiber.StatusBadGateway, "line media fetch failed: "+string(body))
+	}
+	contentType := resp.Header.Get("Content-Type")
+	if contentType == "" {
+		contentType = "image/jpeg"
+	}
+	c.Set("Content-Type", contentType)
+	c.Set("Cache-Control", "private, max-age=300")
+	return c.Send(body)
+}
+
 // ── Helpers ────────────────────────────────────────────────────────────
+
+func conversationIDParam(c *fiber.Ctx) string {
+	id := c.Params("id")
+	if decoded, err := url.PathUnescape(id); err == nil {
+		return decoded
+	}
+	return id
+}
 
 // parseConversationID splits "<provider>:<channel_id>:<user_id>" — the
 // canonical conversation address used by the webhook router. Returns
@@ -326,4 +413,3 @@ func truncatePreview(s string, max int) string {
 	}
 	return string(r[:max]) + "…"
 }
-

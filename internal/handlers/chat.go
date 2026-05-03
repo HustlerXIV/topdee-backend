@@ -33,12 +33,12 @@ import (
 //
 // Patterns we strip:
 //
-//   • (source: foo.pdf)         — round brackets
-//   • [SRC: bar.pdf]            — square brackets, abbreviation
-//   • {sources: a, b}           — curly brackets, plural
-//   • (ที่มา: คู่มือ.pdf)            — Thai
-//   • (แหล่งที่มา: ...)            — Thai (alt)
-//   • (อ้างอิง: ...)              — Thai (citation)
+//   - (source: foo.pdf)         — round brackets
+//   - [SRC: bar.pdf]            — square brackets, abbreviation
+//   - {sources: a, b}           — curly brackets, plural
+//   - (ที่มา: คู่มือ.pdf)            — Thai
+//   - (แหล่งที่มา: ...)            — Thai (alt)
+//   - (อ้างอิง: ...)              — Thai (citation)
 //
 // The leading `\s*` is intentional — we eat the whitespace right before
 // the parenthesized group too, so "Hello (source: x). World" becomes
@@ -75,16 +75,25 @@ type Orchestrator struct {
 	cfg   *config.Config
 }
 
+type runtimeBotSettings struct {
+	systemPrompt string
+	model        string
+	temperature  float64
+	mode         string
+}
+
 func NewOrchestrator(m *db.Mongo, ai *clients.AIClient, cfg *config.Config) *Orchestrator {
 	return &Orchestrator{mongo: m, ai: ai, cfg: cfg}
 }
 
 // HandleIncoming runs the platform-agent pipeline for a single inbound message
-// and returns the AI reply text + sources. It also persists both turns. Used
-// by both the playground handler and channel webhooks.
+// and returns the AI reply text + sources. It always persists the inbound
+// turn, then follows the tenant reply mode before generating or sending an AI
+// turn. Used by both the playground handler and channel webhooks.
 func (o *Orchestrator) HandleIncoming(
 	ctx context.Context,
 	tenantID, conversationID, channel, externalUserID, message string,
+	attachments []models.Attachment,
 ) (reply string, sources []string, convID string, err error) {
 	if conversationID == "" {
 		conversationID = uuid.NewString()
@@ -113,21 +122,30 @@ func (o *Orchestrator) HandleIncoming(
 
 	// Pull the per-tenant bot settings (one tiny lookup). Empty fields fall
 	// back to env defaults inside resolveBotSettings.
-	systemPrompt, model, temperature := o.resolveBotSettings(ctx, tenantID)
+	bot := o.resolveBotSettings(ctx, tenantID)
 
 	now := time.Now().UTC()
+	content := strings.TrimSpace(message)
+	if content == "" && len(attachments) > 0 {
+		content = "[Image]"
+	}
 	userMsg := models.Message{
 		ID:             uuid.NewString(),
 		TenantID:       tenantID,
 		ConversationID: conversationID,
 		Role:           models.RoleUser,
-		Content:        message,
+		Content:        content,
 		Channel:        channel,
 		ExternalUserID: externalUserID,
+		Attachments:    attachments,
 		CreatedAt:      now,
 	}
 	if _, err := o.mongo.DB.Collection("messages").InsertOne(ctx, userMsg); err != nil {
 		return "", nil, conversationID, err
+	}
+
+	if bot.mode == "manual" || strings.TrimSpace(message) == "" {
+		return "", nil, conversationID, nil
 	}
 
 	// Source citations are dashboard-only. Real customers on LINE / Facebook
@@ -139,9 +157,9 @@ func (o *Orchestrator) HandleIncoming(
 	resp, err := o.ai.Chat(ctx, clients.ChatRequest{
 		TenantID:         tenantID,
 		ConversationID:   conversationID,
-		SystemPrompt:     systemPrompt,
-		Model:            model,
-		Temperature:      temperature,
+		SystemPrompt:     bot.systemPrompt,
+		Model:            bot.model,
+		Temperature:      bot.temperature,
 		History:          history,
 		Message:          message,
 		KnowledgeBaseIDs: kbIDs,
@@ -164,11 +182,16 @@ func (o *Orchestrator) HandleIncoming(
 		resp.Sources = nil
 	}
 
+	role := models.RoleAI
+	if channel != models.ChannelDashboard && bot.mode == "suggest" {
+		role = models.RoleSuggestion
+	}
+
 	aiMsg := models.Message{
 		ID:             uuid.NewString(),
 		TenantID:       tenantID,
 		ConversationID: conversationID,
-		Role:           models.RoleAI,
+		Role:           role,
 		Content:        resp.Reply,
 		Channel:        channel,
 		Metadata: map[string]any{
@@ -181,6 +204,9 @@ func (o *Orchestrator) HandleIncoming(
 		return "", nil, conversationID, err
 	}
 
+	if role == models.RoleSuggestion {
+		return "", resp.Sources, conversationID, nil
+	}
 	return resp.Reply, resp.Sources, conversationID, nil
 }
 
@@ -201,6 +227,9 @@ func (o *Orchestrator) loadHistory(ctx context.Context, tenantID, convID string,
 	// reverse to chronological
 	for i := len(msgs) - 1; i >= 0; i-- {
 		role := msgs[i].Role
+		if role == models.RoleSuggestion {
+			continue
+		}
 		if role == models.RoleAI || role == models.RoleHuman {
 			role = "assistant"
 		}
@@ -214,8 +243,8 @@ func (o *Orchestrator) loadHistory(ctx context.Context, tenantID, convID string,
 //
 // Layout of the final system prompt sent to the AI:
 //
-//   <Identity block>           ← name + persona + language, prepended
-//   <User-provided prompt>     ← what the admin wrote on /bot
+//	<Identity block>           ← name + persona + language, prepended
+//	<User-provided prompt>     ← what the admin wrote on /bot
 //
 // We put identity FIRST (highest weight in most LLMs) and phrase it
 // unambiguously so questions like "what's your name?" don't fall through
@@ -225,29 +254,35 @@ func (o *Orchestrator) loadHistory(ctx context.Context, tenantID, convID string,
 //
 // On any Mongo error we silently fall back to env defaults — chat must never
 // fail just because the bot-settings lookup hiccuped.
-func (o *Orchestrator) resolveBotSettings(ctx context.Context, tenantID string) (string, string, float64) {
-	systemPrompt := o.cfg.PlatformSystemPrompt
-	model := o.cfg.PlatformModel
-	temperature := o.cfg.PlatformTemperature
+func (o *Orchestrator) resolveBotSettings(ctx context.Context, tenantID string) runtimeBotSettings {
+	settings := runtimeBotSettings{
+		systemPrompt: o.cfg.PlatformSystemPrompt,
+		model:        o.cfg.PlatformModel,
+		temperature:  o.cfg.PlatformTemperature,
+		mode:         "auto",
+	}
 
 	var t models.Tenant
 	if err := o.mongo.DB.Collection("tenants").
 		FindOne(ctx, bson.M{"_id": tenantID}).Decode(&t); err != nil {
-		return systemPrompt, model, temperature
+		return settings
 	}
 	b := t.Bot
 	if b == nil {
-		return systemPrompt, model, temperature
+		return settings
 	}
 
 	if b.SystemPrompt != "" {
-		systemPrompt = b.SystemPrompt
+		settings.systemPrompt = b.SystemPrompt
 	}
 	if b.Model != "" {
-		model = b.Model
+		settings.model = b.Model
 	}
 	if b.Temperature != nil {
-		temperature = *b.Temperature
+		settings.temperature = *b.Temperature
+	}
+	if b.Mode == "auto" || b.Mode == "suggest" || b.Mode == "manual" {
+		settings.mode = b.Mode
 	}
 
 	// Build the identity preamble. Each line is a directive with no ambiguity.
@@ -274,10 +309,10 @@ func (o *Orchestrator) resolveBotSettings(ctx context.Context, tenantID string) 
 
 	if len(identity) > 0 {
 		preamble := "[Identity]\n" + strings.Join(identity, "\n") + "\n\n[Instructions]\n"
-		systemPrompt = preamble + systemPrompt
+		settings.systemPrompt = preamble + settings.systemPrompt
 	}
 
-	return systemPrompt, model, temperature
+	return settings
 }
 
 // businessHoursHint returns a multi-line directive describing the open/closed
@@ -287,11 +322,11 @@ func (o *Orchestrator) resolveBotSettings(ctx context.Context, tenantID string) 
 //
 // Behavior the prompt encodes:
 //
-//   • OPEN  → carry on as normal.
-//   • CLOSED → still answer the customer's question using the knowledge base,
-//              then append a bilingual closing-time notice. Only fall back to
-//              the saved out-of-hours message when the question genuinely
-//              needs a human (refund, complaint, custom request).
+//   - OPEN  → carry on as normal.
+//   - CLOSED → still answer the customer's question using the knowledge base,
+//     then append a bilingual closing-time notice. Only fall back to
+//     the saved out-of-hours message when the question genuinely
+//     needs a human (refund, complaint, custom request).
 //
 // Returns empty string when the tenant hasn't configured hours yet.
 func businessHoursHint(bh *models.BusinessHours) string {
@@ -476,7 +511,7 @@ func (h *PlaygroundHandler) Send(c *fiber.Ctx) error {
 	}
 
 	reply, sources, convID, err := h.o.HandleIncoming(
-		c.Context(), tid, req.ConversationID, models.ChannelDashboard, "", req.Message,
+		c.Context(), tid, req.ConversationID, models.ChannelDashboard, "", req.Message, nil,
 	)
 	if err != nil {
 		return fiber.NewError(fiber.StatusBadGateway, err.Error())

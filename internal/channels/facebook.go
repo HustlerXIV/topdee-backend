@@ -62,12 +62,22 @@ func (FacebookProvider) ParseEvents(body []byte) ([]ParsedEvent, error) {
 			ID        string `json:"id"` // page id
 			Time      int64  `json:"time"`
 			Messaging []struct {
-				Sender    struct{ ID string `json:"id"` } `json:"sender"`
-				Recipient struct{ ID string `json:"id"` } `json:"recipient"`
-				Timestamp int64  `json:"timestamp"`
+				Sender struct {
+					ID string `json:"id"`
+				} `json:"sender"`
+				Recipient struct {
+					ID string `json:"id"`
+				} `json:"recipient"`
+				Timestamp int64 `json:"timestamp"`
 				Message   *struct {
-					Text   string `json:"text"`
-					IsEcho bool   `json:"is_echo"`
+					Text        string `json:"text"`
+					IsEcho      bool   `json:"is_echo"`
+					Attachments []struct {
+						Type    string `json:"type"`
+						Payload struct {
+							URL string `json:"url"`
+						} `json:"payload"`
+					} `json:"attachments"`
 				} `json:"message"`
 			} `json:"messaging"`
 		} `json:"entry"`
@@ -83,7 +93,17 @@ func (FacebookProvider) ParseEvents(body []byte) ([]ParsedEvent, error) {
 				// back from Meta — drop them or we'll loop.
 				continue
 			}
-			if strings.TrimSpace(m.Message.Text) == "" {
+			text := strings.TrimSpace(m.Message.Text)
+			attachments := make([]models.Attachment, 0, len(m.Message.Attachments))
+			for _, a := range m.Message.Attachments {
+				if a.Type == "image" && a.Payload.URL != "" {
+					attachments = append(attachments, models.Attachment{
+						Type: "image",
+						URL:  a.Payload.URL,
+					})
+				}
+			}
+			if text == "" && len(attachments) == 0 {
 				continue
 			}
 			ts := time.UnixMilli(m.Timestamp)
@@ -93,7 +113,8 @@ func (FacebookProvider) ParseEvents(body []byte) ([]ParsedEvent, error) {
 			out = append(out, ParsedEvent{
 				ExternalChannelID: e.ID,
 				ExternalUserID:    m.Sender.ID,
-				Text:              m.Message.Text,
+				Text:              text,
+				Attachments:       attachments,
 				Timestamp:         ts,
 			})
 		}
@@ -161,10 +182,10 @@ func (FacebookProvider) Send(ctx context.Context, conn *models.ChannelConnection
 //
 // Scopes:
 //
-//   • pages_show_list   — list the user's pages
-//   • pages_messaging   — send messages on behalf of those pages
-//   • pages_manage_metadata — required to subscribe to webhooks
-//   • business_management   — needed for some shared-page setups
+//   - pages_show_list   — list the user's pages
+//   - pages_messaging   — send messages on behalf of those pages
+//   - pages_manage_metadata — required to subscribe to webhooks
+//   - business_management   — needed for some shared-page setups
 func FacebookLoginURL(cfg *config.Config, state string) string {
 	q := url.Values{}
 	q.Set("client_id", cfg.FBAppID)

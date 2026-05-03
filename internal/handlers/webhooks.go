@@ -152,7 +152,7 @@ func processEvents(
 			conversationID := fmt.Sprintf("%s:%s:%s", p.Name(), externalID, evt.ExternalUserID)
 			reply, _, _, err := o.HandleIncoming(
 				ctx, conn.TenantID, conversationID,
-				channelTag, evt.ExternalUserID, evt.Text,
+				channelTag, evt.ExternalUserID, evt.Text, evt.Attachments,
 			)
 			if err != nil {
 				log.Printf("webhook %s: orchestrator: %v", p.Name(), err)

@@ -64,6 +64,7 @@ func (LineProvider) ParseEvents(body []byte) ([]ParsedEvent, error) {
 				UserID string `json:"userId"`
 			} `json:"source"`
 			Message *struct {
+				ID   string `json:"id"`
 				Type string `json:"type"`
 				Text string `json:"text"`
 			} `json:"message"`
@@ -74,19 +75,27 @@ func (LineProvider) ParseEvents(body []byte) ([]ParsedEvent, error) {
 	}
 	out := make([]ParsedEvent, 0, len(p.Events))
 	for _, e := range p.Events {
-		// Only handle plain text messages from a 1:1 user for now. Group/room
-		// events, sticker/image messages, and follow/unfollow are dropped
-		// silently — they'd just confuse the orchestrator.
-		if e.Type != "message" || e.Message == nil || e.Message.Type != "text" {
+		if e.Type != "message" || e.Message == nil {
 			continue
 		}
-		if strings.TrimSpace(e.Message.Text) == "" {
+		text := strings.TrimSpace(e.Message.Text)
+		attachments := []models.Attachment{}
+		if e.Message.Type == "image" && e.Message.ID != "" {
+			attachments = append(attachments, models.Attachment{
+				ID:          e.Message.ID,
+				Type:        "image",
+				URL:         "/api/v1/inbox/media/" + url.PathEscape(e.Message.ID),
+				ContentType: "image/jpeg",
+			})
+		}
+		if text == "" && len(attachments) == 0 {
 			continue
 		}
 		out = append(out, ParsedEvent{
 			ExternalChannelID: p.Destination,
 			ExternalUserID:    e.Source.UserID,
-			Text:              e.Message.Text,
+			Text:              text,
+			Attachments:       attachments,
 			Timestamp:         time.UnixMilli(e.Timestamp),
 			ReplyToken:        e.ReplyToken,
 		})
@@ -221,8 +230,8 @@ func doLinePost(ctx context.Context, url, token string, body []byte) error {
 // users to copy-paste the access token by hand: every Messaging API channel
 // can mint tokens this way without any extra console setup.
 //
-//   POST https://api.line.me/v2/oauth/accessToken
-//   grant_type=client_credentials & client_id=<id> & client_secret=<secret>
+//	POST https://api.line.me/v2/oauth/accessToken
+//	grant_type=client_credentials & client_id=<id> & client_secret=<secret>
 //
 // Returns (token, expires_in_seconds, err). Up to two tokens issued this
 // way can be live at the same time, so refresh-before-expiry is safe.
@@ -275,7 +284,7 @@ func LineIssueAccessToken(ctx context.Context, channelID, channelSecret string) 
 // returns 404 from LINE otherwise, in which case we fall back to the
 // placeholder. Best-effort, called fire-and-forget on inbound messages.
 //
-//   GET /v2/bot/profile/{userId}
+//	GET /v2/bot/profile/{userId}
 //
 // Quota: 2,000 calls/sec — far more than we'll ever hit. Persist the
 // result in `customer_profiles` so we don't re-fetch on every poll.

@@ -160,6 +160,7 @@ func main() {
 	// human-agent replies through the right provider's push API.
 	inboxH := handlers.NewInboxHandler(mongo, channelRegistry, channelStore)
 	protected.Get("/inbox/conversations", inboxH.ListConversations)
+	protected.Get("/inbox/media/:id", inboxH.GetMedia)
 	protected.Get("/inbox/conversations/:id/messages", inboxH.GetMessages)
 	protected.Post("/inbox/conversations/:id/messages", inboxH.SendMessage)
 

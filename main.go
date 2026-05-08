@@ -120,6 +120,13 @@ func main() {
 	protected.Get("/bot", botH.Get)
 	protected.Put("/bot", botH.Update)
 
+	// Settings — current user's account, password, and workspace profile.
+	settingsH := handlers.NewSettingsHandler(mongo)
+	protected.Get("/settings", settingsH.Get)
+	protected.Patch("/settings/account", settingsH.UpdateAccount)
+	protected.Patch("/settings/password", settingsH.UpdatePassword)
+	protected.Patch("/settings/workspace", settingsH.UpdateWorkspace)
+
 	// Team — members + invites. Anyone in the workspace can list members,
 	// but write operations are gated to owner/admin via RequireRole.
 	manage := middleware.RequireRole("owner", "admin")

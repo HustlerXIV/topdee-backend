@@ -259,40 +259,68 @@ func cacheCustomerProfile(p channels.Provider, store *channels.Store, conn *mode
 	if evt.ExternalUserID == "" {
 		return
 	}
-	// Only LINE for now. Add per-provider profile fetchers here as we
-	// build them out.
-	if p.Name() != models.ProviderLine {
+
+	provider := p.Name()
+	if provider != models.ProviderLine && provider != models.ProviderFacebook {
 		return
 	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	// Skip the network round-trip if we already have a profile that's
-	// less than 7 days old.
-	if existing, _ := store.GetProfile(ctx, p.Name(), evt.ExternalUserID); existing != nil {
+	// Skip the network round-trip if we already have a fresh profile.
+	if existing, _ := store.GetProfile(ctx, provider, evt.ExternalUserID); existing != nil {
 		if time.Since(existing.UpdatedAt) < 7*24*time.Hour {
 			return
 		}
 	}
 
-	token := conn.Credentials["channel_access_token"]
-	if token == "" {
-		return
+	var displayName, pictureURL, language string
+
+	switch provider {
+	case models.ProviderLine:
+		token := conn.Credentials["channel_access_token"]
+		if token == "" {
+			return
+		}
+		resp, err := channels.LineUserProfile(ctx, token, evt.ExternalUserID)
+		if err != nil {
+			log.Printf("inbox: LINE profile fetch: %v", err)
+			return
+		}
+		if resp == nil || resp.DisplayName == "" {
+			return
+		}
+		displayName = resp.DisplayName
+		pictureURL = resp.PictureURL
+		language = resp.Language
+
+	case models.ProviderFacebook:
+		token := conn.Credentials["page_access_token"]
+		if token == "" {
+			return
+		}
+		resp, err := channels.FacebookUserProfile(ctx, token, evt.ExternalUserID)
+		if err != nil {
+			log.Printf("inbox: Facebook profile fetch: %v", err)
+			return
+		}
+		if resp == nil || resp.DisplayName == "" {
+			// Meta restricts profile access in many cases — fail silently.
+			return
+		}
+		displayName = resp.DisplayName
+		pictureURL = resp.PictureURL
 	}
-	resp, err := channels.LineUserProfile(ctx, token, evt.ExternalUserID)
-	if err != nil {
-		log.Printf("inbox: LINE profile fetch: %v", err)
-		return
-	}
-	if resp == nil || resp.DisplayName == "" {
-		// User isn't a friend / blocked profile sharing — nothing to cache.
+
+	if displayName == "" {
 		return
 	}
 	_ = store.UpsertProfile(ctx, &models.CustomerProfile{
-		Provider:       p.Name(),
+		Provider:       provider,
 		ExternalUserID: evt.ExternalUserID,
-		DisplayName:    resp.DisplayName,
-		PictureURL:     resp.PictureURL,
-		Language:       resp.Language,
+		DisplayName:    displayName,
+		PictureURL:     pictureURL,
+		Language:       language,
 	})
 }

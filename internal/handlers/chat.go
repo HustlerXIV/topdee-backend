@@ -8,6 +8,7 @@ package handlers
 import (
 	"context"
 	"errors"
+	"fmt"
 	"regexp"
 	"strings"
 	"time"
@@ -146,6 +147,27 @@ func (o *Orchestrator) HandleIncoming(
 
 	if bot.mode == "manual" || strings.TrimSpace(message) == "" {
 		return "", nil, conversationID, nil
+	}
+
+	// ── Monthly AI quota gate ─────────────────────────────────────────────────
+	// Only enforced on real customer channels (not the dashboard playground).
+	// Human-agent replies come through InboxHandler.SendMessage and never
+	// reach this code, so agents can always reply regardless of quota.
+	if channel != models.ChannelDashboard {
+		if exceeded, upgradeMsg := o.checkMonthlyQuota(ctx, tenant); exceeded {
+			quotaNotice := models.Message{
+				ID:             uuid.NewString(),
+				TenantID:       tenantID,
+				ConversationID: conversationID,
+				Role:           models.RoleAI,
+				Content:        upgradeMsg,
+				Channel:        channel,
+				ExternalUserID: externalUserID,
+				CreatedAt:      time.Now().UTC(),
+			}
+			_, _ = o.mongo.DB.Collection("messages").InsertOne(ctx, quotaNotice)
+			return upgradeMsg, nil, conversationID, nil
+		}
 	}
 
 	// Source citations are dashboard-only. Real customers on LINE / Facebook
@@ -601,4 +623,86 @@ func (h *PlaygroundHandler) ListConversations(c *fiber.Ctx) error {
 		out = []playgroundConversationSummary{}
 	}
 	return c.JSON(out)
+}
+
+// ── Monthly quota helpers ─────────────────────────────────────────────────────
+
+// checkMonthlyQuota returns (true, upgradeMessage) when the tenant has
+// consumed more inbound messages this calendar month than their plan allows.
+// Returns (false, "") when the tenant is within limits or has an unlimited plan.
+func (o *Orchestrator) checkMonthlyQuota(ctx context.Context, tenant models.Tenant) (bool, string) {
+	tctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+
+	// Minimal projection — we only need the message limit and sort_order.
+	var plan struct {
+		SortOrder int `bson:"sort_order"`
+		Limits    struct {
+			MessagesPerMonth int `bson:"messages_per_month"`
+		} `bson:"limits"`
+	}
+	if err := o.mongo.DB.Collection("plans").
+		FindOne(tctx, bson.M{"_id": tenant.Plan}).Decode(&plan); err != nil {
+		return false, "" // unknown plan → don't block
+	}
+	limit := plan.Limits.MessagesPerMonth
+	if limit == -1 {
+		return false, "" // unlimited plan
+	}
+
+	// Count inbound (user-role) messages on real channels this calendar month.
+	now := time.Now().UTC()
+	startOfMonth := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, time.UTC)
+	used, _ := o.mongo.DB.Collection("messages").CountDocuments(tctx, bson.M{
+		"tenant_id":  tenant.ID,
+		"role":       models.RoleUser,
+		"channel":    bson.M{"$ne": models.ChannelDashboard},
+		"created_at": bson.M{"$gte": startOfMonth},
+	})
+
+	if int(used) <= limit {
+		return false, ""
+	}
+
+	// Limit exceeded — find the next public plan above this one.
+	nextPlanName := ""
+	var next struct {
+		DisplayName string `bson:"display_name"`
+	}
+	if err := o.mongo.DB.Collection("plans").FindOne(
+		tctx,
+		bson.M{
+			"sort_order": bson.M{"$gt": plan.SortOrder},
+			"is_active":  true,
+			"is_public":  true,
+		},
+		options.FindOne().SetSort(bson.D{{Key: "sort_order", Value: 1}}),
+	).Decode(&next); err == nil {
+		nextPlanName = next.DisplayName
+	}
+
+	return true, buildQuotaMessage(limit, nextPlanName)
+}
+
+// buildQuotaMessage returns a bilingual (Thai + English) message telling the
+// customer they have hit their monthly AI limit and, when a next plan exists,
+// suggesting they upgrade.
+func buildQuotaMessage(limit int, nextPlan string) string {
+	limitStr := fmt.Sprintf("%d", limit)
+
+	upgradeTH := ""
+	upgradeEN := ""
+	if nextPlan != "" {
+		upgradeTH = fmt.Sprintf(" กรุณาอัปเกรดเป็นแผน **%s** เพื่อรับการตอบกลับจาก AI ได้อย่างต่อเนื่อง", nextPlan)
+		upgradeEN = fmt.Sprintf(" Please upgrade to the **%s** plan to continue receiving AI responses.", nextPlan)
+	}
+
+	return fmt.Sprintf(
+		"ขออภัย 🙏 การตอบกลับอัตโนมัติของเราถึงขีดจำกัด %s ข้อความต่อเดือนแล้ว%s\n"+
+			"ทีมงานของเรายังพร้อมช่วยเหลือคุณโดยตรงนะคะ\n\n"+
+			"Sorry 🙏 Our AI has reached its %s messages/month limit.%s\n"+
+			"Our team can still assist you directly.",
+		limitStr, upgradeTH,
+		limitStr, upgradeEN,
+	)
 }

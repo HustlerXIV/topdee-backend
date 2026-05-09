@@ -192,7 +192,7 @@ func FacebookLoginURL(cfg *config.Config, state string) string {
 	q.Set("redirect_uri", cfg.FBOAuthRedirectURI)
 	q.Set("state", state)
 	q.Set("response_type", "code")
-	q.Set("scope", "pages_show_list,pages_messaging,pages_manage_metadata,business_management")
+	q.Set("scope", "pages_show_list,pages_messaging,pages_manage_metadata")
 	return "https://www.facebook.com/" + graphVersion + "/dialog/oauth?" + q.Encode()
 }
 
@@ -273,13 +273,33 @@ func FacebookListPages(ctx context.Context, userAccessToken string) ([]models.Fa
 		rb, _ := io.ReadAll(resp.Body)
 		return nil, fmt.Errorf("fb list pages: %s: %s", resp.Status, string(rb))
 	}
+
+	// Use a local struct with json:"access_token" to decode Meta's API
+	// response — models.FacebookOAuthPage has json:"-" on AccessToken to
+	// prevent it from leaking to the frontend, so we can't use it directly
+	// for JSON decoding here.
+	type pageResp struct {
+		ID          string `json:"id"`
+		Name        string `json:"name"`
+		Category    string `json:"category"`
+		AccessToken string `json:"access_token"`
+	}
 	var out struct {
-		Data []models.FacebookOAuthPage `json:"data"`
+		Data []pageResp `json:"data"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
 		return nil, err
 	}
-	return out.Data, nil
+	pages := make([]models.FacebookOAuthPage, 0, len(out.Data))
+	for _, p := range out.Data {
+		pages = append(pages, models.FacebookOAuthPage{
+			ID:          p.ID,
+			Name:        p.Name,
+			Category:    p.Category,
+			AccessToken: p.AccessToken,
+		})
+	}
+	return pages, nil
 }
 
 // FacebookSubscribePage subscribes our app to receive message webhooks for
@@ -287,7 +307,50 @@ func FacebookListPages(ctx context.Context, userAccessToken string) ([]models.Fa
 // even though the user granted permission.
 //
 // Idempotent — calling it again on an already-subscribed page is a no-op.
+// FacebookUserProfile fetches the display name and profile picture of a
+// Messenger user (identified by their page-scoped PSID) using the page
+// access token. Returns nil when the user's profile is not accessible
+// (e.g. they haven't interacted, or the app lacks permission).
+func FacebookUserProfile(ctx context.Context, pageAccessToken, psid string) (*UserProfile, error) {
+	u := "https://graph.facebook.com/" + graphVersion + "/" + url.PathEscape(psid) +
+		"?fields=name,profile_pic&access_token=" + url.QueryEscape(pageAccessToken)
+	req, err := http.NewRequestWithContext(ctx, "GET", u, nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		// Profile not accessible — not an error we surface, just return nil.
+		return nil, nil
+	}
+	var out struct {
+		Name       string `json:"name"`
+		ProfilePic string `json:"profile_pic"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, err
+	}
+	if out.Name == "" {
+		return nil, nil
+	}
+	return &UserProfile{DisplayName: out.Name, PictureURL: out.ProfilePic}, nil
+}
+
+// UserProfile is a minimal cross-provider profile result.
+type UserProfile struct {
+	DisplayName string
+	PictureURL  string
+	Language    string
+}
+
 func FacebookSubscribePage(ctx context.Context, pageAccessToken, pageID string) error {
+	if pageAccessToken == "" {
+		return fmt.Errorf("page access token is empty — ensure pages_manage_metadata permission is granted in the Meta app and re-connect the page")
+	}
 	u := "https://graph.facebook.com/" + graphVersion + "/" + url.PathEscape(pageID) + "/subscribed_apps"
 	body := url.Values{
 		"subscribed_fields": {"messages,messaging_postbacks"},

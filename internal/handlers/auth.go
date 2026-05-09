@@ -53,11 +53,33 @@ func (h *AuthHandler) Register(c *fiber.Ctx) error {
 	}
 
 	now := time.Now().UTC()
+
+	// Look up the free plan's expiry_days so we can auto-stamp a trial end
+	// date. Best-effort — if the plans collection isn't seeded yet we just
+	// leave subscription nil and the tenant has unlimited access until an
+	// admin sets it manually.
+	var initialSubscription *models.Subscription
+	var freePlan struct {
+		ExpiryDays int `bson:"expiry_days"`
+	}
+	if err := h.mongo.DB.Collection("plans").
+		FindOne(c.Context(), bson.M{"_id": "free"}).Decode(&freePlan); err == nil {
+		if freePlan.ExpiryDays > 0 {
+			trialEnd := now.AddDate(0, 0, freePlan.ExpiryDays)
+			initialSubscription = &models.Subscription{
+				Status:      models.SubStatusTrialing,
+				TrialEndsAt: &trialEnd,
+				UpdatedAt:   now,
+			}
+		}
+	}
+
 	tenant := models.Tenant{
-		ID:        uuid.NewString(),
-		Name:      req.TenantName,
-		Plan:      "free",
-		CreatedAt: now,
+		ID:           uuid.NewString(),
+		Name:         req.TenantName,
+		Plan:         "free",
+		Subscription: initialSubscription,
+		CreatedAt:    now,
 	}
 	if _, err := h.mongo.DB.Collection("tenants").InsertOne(c.Context(), tenant); err != nil {
 		return err

@@ -63,6 +63,11 @@ func main() {
 		}
 	}
 
+	// Seed default plans if the collection is empty.
+	if err := handlers.SeedDefaultPlans(mongo); err != nil {
+		log.Printf("plans: seed error (non-fatal): %v", err)
+	}
+
 	app := fiber.New(fiber.Config{
 		AppName:      "topdee-backend",
 		BodyLimit:    25 * 1024 * 1024, // 25MB to allow PDF uploads
@@ -85,6 +90,9 @@ func main() {
 	api.Post("/auth/register", authH.Register)
 	api.Post("/auth/login", authH.Login)
 
+	// Public plans — no auth, used by homepage and billing page.
+	api.Get("/plans", handlers.PublicPlans(mongo))
+
 	// Public accept-invite — exchanges a token for a new user + JWT.
 	teamH := handlers.NewTeamHandler(mongo, cfg)
 	api.Post("/auth/accept-invite", teamH.AcceptInvite)
@@ -106,6 +114,11 @@ func main() {
 	protected.Get("/admin/users", middleware.RequireAdmin(), adminH.ListUsers)
 	protected.Patch("/admin/users/:id", middleware.RequireAdmin(), adminH.UpdateUser)
 	protected.Delete("/admin/users/:id", middleware.RequireAdmin(), adminH.DeleteUser)
+	protected.Get("/admin/plans", middleware.RequireAdmin(), adminH.ListPlans)
+	protected.Post("/admin/plans", middleware.RequireAdmin(), adminH.CreatePlan)
+	protected.Get("/admin/plans/:id", middleware.RequireAdmin(), adminH.GetPlan)
+	protected.Put("/admin/plans/:id", middleware.RequireAdmin(), adminH.UpdatePlan)
+	protected.Delete("/admin/plans/:id", middleware.RequireAdmin(), adminH.DeletePlan)
 
 	// Knowledge bases
 	kbH := handlers.NewKnowledgeHandler(mongo, aiClient)

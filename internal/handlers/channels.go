@@ -344,7 +344,7 @@ func (h *ChannelsHandler) FacebookOAuthConnect(c *fiber.Ctx) error {
 	// Pre-flight: make sure connecting all the requested pages won't bust
 	// the plan limit. We count both existing connections and the new ones.
 	plan := tenantPlan(c.Context(), h.mongo, tid)
-	limit := channels.LimitFor(plan, models.ProviderFacebook)
+	limit := channels.LimitForCtx(c.Context(), h.mongo.DB, plan, models.ProviderFacebook)
 	used, err := h.store.CountByProvider(c.Context(), tid, models.ProviderFacebook)
 	if err != nil {
 		return err
@@ -405,7 +405,7 @@ func (h *ChannelsHandler) FacebookOAuthConnect(c *fiber.Ctx) error {
 // counting it twice.
 func (h *ChannelsHandler) enforceLimit(c *fiber.Ctx, tid, provider, externalID string) error {
 	plan := tenantPlan(c.Context(), h.mongo, tid)
-	limit := channels.LimitFor(plan, provider)
+	limit := channels.LimitForCtx(c.Context(), h.mongo.DB, plan, provider)
 
 	// Existing connection? Reconnect is always allowed — we just upsert.
 	existing, err := h.store.FindByExternal(c.Context(), provider, externalID)

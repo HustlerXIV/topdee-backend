@@ -607,6 +607,12 @@ type planReq struct {
 	IsRecommended bool              `json:"is_recommended"`
 	SortOrder     int               `json:"sort_order"`
 	ExpiryDays    int               `json:"expiry_days"`
+	// Stripe price IDs — managed in Admin → Plans UI, not env vars.
+	StripePriceID       string  `json:"stripe_price_id"`
+	StripePriceIDYearly string  `json:"stripe_price_id_yearly"`
+	// Yearly display pricing — what to show on the billing page.
+	YearlyPrice       float64 `json:"yearly_price"`
+	YearlySavingLabel string  `json:"yearly_saving_label"`
 	Limits        models.PlanLimits `json:"limits"`
 }
 
@@ -631,19 +637,23 @@ func (h *AdminHandler) CreatePlan(c *fiber.Ctx) error {
 
 	now := time.Now().UTC()
 	plan := models.Plan{
-		ID:            strings.ToLower(strings.TrimSpace(req.ID)),
-		DisplayName:   req.DisplayName,
-		Description:   req.Description,
-		Price:         req.Price,
-		Currency:      req.Currency,
-		IsActive:      req.IsActive,
-		IsPublic:      req.IsPublic,
-		IsRecommended: req.IsRecommended,
-		SortOrder:     req.SortOrder,
-		ExpiryDays:    req.ExpiryDays,
-		Limits:        req.Limits,
-		CreatedAt:     now,
-		UpdatedAt:     now,
+		ID:                  strings.ToLower(strings.TrimSpace(req.ID)),
+		DisplayName:         req.DisplayName,
+		Description:         req.Description,
+		Price:               req.Price,
+		Currency:            req.Currency,
+		IsActive:            req.IsActive,
+		IsPublic:            req.IsPublic,
+		IsRecommended:       req.IsRecommended,
+		SortOrder:           req.SortOrder,
+		ExpiryDays:          req.ExpiryDays,
+		StripePriceID:       strings.TrimSpace(req.StripePriceID),
+		StripePriceIDYearly: strings.TrimSpace(req.StripePriceIDYearly),
+		YearlyPrice:         req.YearlyPrice,
+		YearlySavingLabel:   strings.TrimSpace(req.YearlySavingLabel),
+		Limits:              req.Limits,
+		CreatedAt:           now,
+		UpdatedAt:           now,
 	}
 	if _, err := h.mongo.DB.Collection("plans").InsertOne(c.Context(), plan); err != nil {
 		return fiber.NewError(fiber.StatusConflict, "plan id already exists")
@@ -669,17 +679,21 @@ func (h *AdminHandler) UpdatePlan(c *fiber.Ctx) error {
 	}
 
 	set := bson.M{
-		"display_name":   req.DisplayName,
-		"description":    req.Description,
-		"price":          req.Price,
-		"currency":       req.Currency,
-		"is_active":      req.IsActive,
-		"is_public":      req.IsPublic,
-		"is_recommended": req.IsRecommended,
-		"sort_order":     req.SortOrder,
-		"expiry_days":    req.ExpiryDays,
-		"limits":         req.Limits,
-		"updated_at":     time.Now().UTC(),
+		"display_name":          req.DisplayName,
+		"description":           req.Description,
+		"price":                 req.Price,
+		"currency":              req.Currency,
+		"is_active":             req.IsActive,
+		"is_public":             req.IsPublic,
+		"is_recommended":        req.IsRecommended,
+		"sort_order":            req.SortOrder,
+		"expiry_days":           req.ExpiryDays,
+		"stripe_price_id":       strings.TrimSpace(req.StripePriceID),
+		"stripe_price_id_yearly": strings.TrimSpace(req.StripePriceIDYearly),
+		"yearly_price":          req.YearlyPrice,
+		"yearly_saving_label":   strings.TrimSpace(req.YearlySavingLabel),
+		"limits":                req.Limits,
+		"updated_at":            time.Now().UTC(),
 	}
 	res, err := h.mongo.DB.Collection("plans").UpdateOne(
 		c.Context(), bson.M{"_id": id}, bson.M{"$set": set},

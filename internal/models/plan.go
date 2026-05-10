@@ -27,6 +27,17 @@ type Plan struct {
 	// pricing page. At most one plan should be recommended at a time.
 	IsRecommended  bool       `bson:"is_recommended"  json:"is_recommended"`
 	SortOrder   int        `bson:"sort_order"   json:"sort_order"`
+	// StripePriceID is the monthly recurring Stripe Price id (price_xxx).
+	// StripePriceIDYearly is the annual recurring Stripe Price id.
+	// Both are set via Admin → Plans; leave empty for free/custom plans.
+	StripePriceID       string `bson:"stripe_price_id,omitempty"        json:"stripe_price_id,omitempty"`
+	StripePriceIDYearly string `bson:"stripe_price_id_yearly,omitempty" json:"stripe_price_id_yearly,omitempty"`
+	// YearlyPrice is the display price charged per year (e.g. 9900 for ฿9,900/yr).
+	// Set this to whatever the Stripe yearly price actually charges.
+	YearlyPrice float64 `bson:"yearly_price,omitempty" json:"yearly_price,omitempty"`
+	// YearlySavingLabel is a short badge shown next to the yearly option,
+	// e.g. "2 months free", "Save 17%", "Best value". Leave empty to hide.
+	YearlySavingLabel string `bson:"yearly_saving_label,omitempty" json:"yearly_saving_label,omitempty"`
 	// ExpiryDays is the number of days after which a tenant on this plan
 	// loses access. 0 means no expiry (access forever). When set, the
 	// register handler automatically stamps subscription.trial_ends_at.

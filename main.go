@@ -186,8 +186,13 @@ func main() {
 
 	// Stripe billing — tenant-scoped self-service.
 	billingH := handlers.NewBillingHandler(mongo, cfg)
+	protected.Get("/billing", billingH.GetInfo)
 	protected.Post("/billing/checkout-session", billingH.CreateCheckoutSession)
 	protected.Post("/billing/portal-session", billingH.CreatePortalSession)
+	protected.Get("/billing/payment-methods", billingH.ListPaymentMethods)
+	protected.Delete("/billing/payment-methods/:id", billingH.RemovePaymentMethod)
+	protected.Post("/billing/cancel", billingH.CancelSubscription)
+	protected.Post("/billing/reactivate", billingH.ReactivateSubscription)
 
 	// Public webhooks (secured by signature verification). The generic
 	// /webhooks/:provider route covers every social platform via the
@@ -207,6 +212,30 @@ func main() {
 	webhooks.Post("/:provider", webhookHandler)
 	webhooks.Get("/:provider/:external_id", webhookHandler)
 	webhooks.Post("/:provider/:external_id", webhookHandler)
+
+	// Background subscription expiry sweep.
+	//
+	// Runs once at startup (to catch any lapsed tenants from downtime) and
+	// then every hour. This is the safety net for missed Stripe webhooks and
+	// for admin-assigned plans with expiry_days.
+	go func() {
+		run := func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			n, err := handlers.ExpireSubscriptions(ctx, mongo)
+			if err != nil {
+				log.Printf("[expiry] sweep error: %v", err)
+			} else if n > 0 {
+				log.Printf("[expiry] downgraded %d tenant(s) to free plan", n)
+			}
+		}
+		run() // immediate pass on startup
+		ticker := time.NewTicker(1 * time.Hour)
+		defer ticker.Stop()
+		for range ticker.C {
+			run()
+		}
+	}()
 
 	// graceful shutdown
 	go func() {

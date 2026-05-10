@@ -169,6 +169,7 @@ func handleSubscriptionDeleted(ctx context.Context, mongo *db.Mongo, ev stripe.E
 		bson.M{"$set": bson.M{
 			"subscription":           merged,
 			"stripe_subscription_id": "",
+			"plan":                   "free", // auto-downgrade when subscription ends
 		}},
 	)
 	return err

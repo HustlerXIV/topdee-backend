@@ -20,6 +20,7 @@ import (
 	"github.com/topdee/backend/internal/db"
 	"github.com/topdee/backend/internal/handlers"
 	"github.com/topdee/backend/internal/middleware"
+	"github.com/topdee/backend/internal/realtime"
 )
 
 func main() {
@@ -42,6 +43,8 @@ func main() {
 	}()
 
 	aiClient := clients.NewAIClient(cfg.AIServiceURL)
+
+	hub := realtime.NewHub()
 
 	orch := handlers.NewOrchestrator(mongo, aiClient, cfg)
 
@@ -83,6 +86,13 @@ func main() {
 	// public
 	app.Get("/health", handlers.Health(mongo, aiClient))
 
+	// WebSocket — /ws?token=<jwt>
+	// Browsers can't send Authorization headers on WS connections so we
+	// authenticate via the JWT query param. The hub fans out inbox_update
+	// events to all connected dashboard tabs in the same tenant.
+	app.Use("/ws", handlers.WSUpgrade())
+	app.Get("/ws", handlers.WSHandler(hub, cfg))
+
 	api := app.Group("/api/v1")
 
 	// auth routes (public)
@@ -95,6 +105,7 @@ func main() {
 
 	// Public accept-invite — exchanges a token for a new user + JWT.
 	teamH := handlers.NewTeamHandler(mongo, cfg)
+	api.Get("/auth/invite-info", teamH.InviteInfo)
 	api.Post("/auth/accept-invite", teamH.AcceptInvite)
 
 	// Auth-gated routes. Once `api.Use(RequireAuth)` runs, every subsequent
@@ -178,7 +189,8 @@ func main() {
 	// (Playground messages are excluded server-side.) The handler needs
 	// the channel registry + store too so it can dispatch outbound
 	// human-agent replies through the right provider's push API.
-	inboxH := handlers.NewInboxHandler(mongo, channelRegistry, channelStore)
+	inboxH := handlers.NewInboxHandler(mongo, channelRegistry, channelStore, hub)
+	protected.Get("/inbox/unread-count", inboxH.UnreadCount)
 	protected.Get("/inbox/conversations", inboxH.ListConversations)
 	protected.Get("/inbox/media/:id", inboxH.GetMedia)
 	protected.Get("/inbox/conversations/:id/messages", inboxH.GetMessages)
@@ -193,6 +205,8 @@ func main() {
 	protected.Delete("/billing/payment-methods/:id", billingH.RemovePaymentMethod)
 	protected.Post("/billing/cancel", billingH.CancelSubscription)
 	protected.Post("/billing/reactivate", billingH.ReactivateSubscription)
+	protected.Post("/billing/sync-session", billingH.SyncCheckoutSession)
+	protected.Get("/billing/invoices", billingH.ListInvoices)
 
 	// Public webhooks (secured by signature verification). The generic
 	// /webhooks/:provider route covers every social platform via the
@@ -207,7 +221,7 @@ func main() {
 	//   /webhooks/<provider>/<external_id>   — per-connection URL pasted
 	//                                          into the customer's console
 	//                                          (LINE channel_id, etc.).
-	webhookHandler := handlers.WebhookHandler(channelRegistry, channelStore, mongo, orch, cfg)
+	webhookHandler := handlers.WebhookHandler(channelRegistry, channelStore, mongo, orch, cfg, hub)
 	webhooks.Get("/:provider", webhookHandler)
 	webhooks.Post("/:provider", webhookHandler)
 	webhooks.Get("/:provider/:external_id", webhookHandler)

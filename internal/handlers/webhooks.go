@@ -25,17 +25,20 @@ import (
 
 	"github.com/gofiber/fiber/v2"
 
+	"go.mongodb.org/mongo-driver/bson"
+
 	"github.com/topdee/backend/internal/channels"
 	"github.com/topdee/backend/internal/config"
 	"github.com/topdee/backend/internal/db"
 	"github.com/topdee/backend/internal/models"
+	"github.com/topdee/backend/internal/realtime"
 )
 
 // WebhookHandler returns the generic GET/POST handler for /webhooks/:provider.
 //
 // Both verbs share the same Fiber handler — we dispatch on c.Method() so the
 // router only needs one entry per provider.
-func WebhookHandler(reg *channels.Registry, store *channels.Store, m *db.Mongo, o *Orchestrator, cfg *config.Config) fiber.Handler {
+func WebhookHandler(reg *channels.Registry, store *channels.Store, m *db.Mongo, o *Orchestrator, cfg *config.Config, hub *realtime.Hub) fiber.Handler {
 	return func(c *fiber.Ctx) error {
 		name := strings.ToLower(c.Params("provider"))
 		p, ok := reg.Get(name)
@@ -79,7 +82,7 @@ func WebhookHandler(reg *channels.Registry, store *channels.Store, m *db.Mongo, 
 
 		// Process asynchronously so we always 200 fast — most platforms
 		// time out the webhook after a few seconds.
-		go processEvents(p, store, m, o, cfg, headers, body, events)
+		go processEvents(p, store, m, o, cfg, hub, headers, body, events)
 		return c.SendStatus(fiber.StatusOK)
 	}
 }
@@ -93,6 +96,7 @@ func processEvents(
 	m *db.Mongo,
 	o *Orchestrator,
 	cfg *config.Config,
+	hub *realtime.Hub,
 	headers map[string]string,
 	body []byte,
 	events []channels.ParsedEvent,
@@ -164,6 +168,10 @@ func processEvents(
 			// slow or returns 404 (user hasn't friended the bot, etc.).
 			go cacheCustomerProfile(p, store, conn, evt)
 
+			// Notify connected dashboard tabs that a new customer message
+			// arrived so the inbox badge updates in real-time.
+			go broadcastInboxUpdate(hub, m, conn.TenantID)
+
 			if strings.TrimSpace(reply) == "" {
 				continue
 			}
@@ -174,6 +182,50 @@ func processEvents(
 		}
 		cancel()
 	}
+}
+
+// broadcastInboxUpdate recomputes the unread count for a tenant and pushes
+// an inbox_update event to all connected dashboard tabs via the Hub.
+func broadcastInboxUpdate(hub *realtime.Hub, m *db.Mongo, tenantID string) {
+	if hub == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	pipeline := []bson.M{
+		{"$match": bson.M{
+			"tenant_id": tenantID,
+			"channel":   bson.M{"$ne": models.ChannelDashboard},
+		}},
+		{"$sort": bson.M{"created_at": -1}},
+		{"$group": bson.M{
+			"_id":              "$conversation_id",
+			"last_sender_role": bson.M{"$first": "$role"},
+		}},
+		{"$match": bson.M{"last_sender_role": models.RoleUser}},
+		{"$count": "count"},
+	}
+
+	cur, err := m.DB.Collection("messages").Aggregate(ctx, pipeline)
+	if err != nil {
+		return
+	}
+	defer cur.Close(ctx)
+
+	var result []struct {
+		Count int `bson:"count"`
+	}
+	_ = cur.All(ctx, &result)
+
+	count := 0
+	if len(result) > 0 {
+		count = result[0].Count
+	}
+	hub.Broadcast(tenantID, map[string]any{
+		"type":  "inbox_update",
+		"count": count,
+	})
 }
 
 // ── Facebook OAuth callback ────────────────────────────────────────────

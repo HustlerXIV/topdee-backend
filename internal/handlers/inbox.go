@@ -30,16 +30,103 @@ import (
 	"github.com/topdee/backend/internal/db"
 	"github.com/topdee/backend/internal/middleware"
 	"github.com/topdee/backend/internal/models"
+	"github.com/topdee/backend/internal/realtime"
 )
 
 type InboxHandler struct {
 	mongo    *db.Mongo
 	registry *channels.Registry
 	store    *channels.Store
+	hub      *realtime.Hub
 }
 
-func NewInboxHandler(m *db.Mongo, reg *channels.Registry, store *channels.Store) *InboxHandler {
-	return &InboxHandler{mongo: m, registry: reg, store: store}
+func NewInboxHandler(m *db.Mongo, reg *channels.Registry, store *channels.Store, hub *realtime.Hub) *InboxHandler {
+	return &InboxHandler{mongo: m, registry: reg, store: store, hub: hub}
+}
+
+// UnreadCount returns the number of conversations where the customer spoke
+// last (i.e., conversations waiting for a team or AI reply).
+//
+// GET /api/v1/inbox/unread-count → { "count": 7 }
+func (h *InboxHandler) UnreadCount(c *fiber.Ctx) error {
+	tid := middleware.TenantID(c)
+
+	pipeline := []bson.M{
+		{"$match": bson.M{
+			"tenant_id": tid,
+			"channel":   bson.M{"$ne": models.ChannelDashboard},
+		}},
+		{"$sort": bson.M{"created_at": -1}},
+		{"$group": bson.M{
+			"_id":              "$conversation_id",
+			"last_sender_role": bson.M{"$first": "$role"},
+		}},
+		// "user" role = inbound customer message. If the last message is
+		// from the customer, nobody has replied yet → needs attention.
+		{"$match": bson.M{"last_sender_role": models.RoleUser}},
+		{"$count": "count"},
+	}
+
+	cur, err := h.mongo.DB.Collection("messages").Aggregate(c.Context(), pipeline)
+	if err != nil {
+		return err
+	}
+	defer cur.Close(c.Context())
+
+	var result []struct {
+		Count int `bson:"count"`
+	}
+	_ = cur.All(c.Context(), &result)
+
+	count := 0
+	if len(result) > 0 {
+		count = result[0].Count
+	}
+	return c.JSON(fiber.Map{"count": count})
+}
+
+// broadcastUnread recomputes the unread count for a tenant and pushes an
+// inbox_update event to all connected dashboard tabs. Fire-and-forget.
+func (h *InboxHandler) broadcastUnread(tenantID string) {
+	if h.hub == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	pipeline := []bson.M{
+		{"$match": bson.M{
+			"tenant_id": tenantID,
+			"channel":   bson.M{"$ne": models.ChannelDashboard},
+		}},
+		{"$sort": bson.M{"created_at": -1}},
+		{"$group": bson.M{
+			"_id":              "$conversation_id",
+			"last_sender_role": bson.M{"$first": "$role"},
+		}},
+		{"$match": bson.M{"last_sender_role": models.RoleUser}},
+		{"$count": "count"},
+	}
+
+	cur, err := h.mongo.DB.Collection("messages").Aggregate(ctx, pipeline)
+	if err != nil {
+		return
+	}
+	defer cur.Close(ctx)
+
+	var result []struct {
+		Count int `bson:"count"`
+	}
+	_ = cur.All(ctx, &result)
+
+	count := 0
+	if len(result) > 0 {
+		count = result[0].Count
+	}
+	h.hub.Broadcast(tenantID, map[string]any{
+		"type":  "inbox_update",
+		"count": count,
+	})
 }
 
 // resolveCustomerName uses the cached profile when available, otherwise
@@ -284,6 +371,11 @@ func (h *InboxHandler) SendMessage(c *fiber.Ctx) error {
 	if _, err := h.mongo.DB.Collection("messages").InsertOne(c.Context(), msg); err != nil {
 		return err
 	}
+
+	// Broadcast updated unread count — agent reply marks conversation as
+	// handled so the badge should drop.
+	go h.broadcastUnread(tid)
+
 	return c.JSON(msg)
 }
 

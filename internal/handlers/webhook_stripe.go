@@ -27,6 +27,7 @@ import (
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/stripe/stripe-go/v79"
+	stripesub "github.com/stripe/stripe-go/v79/subscription"
 	"github.com/stripe/stripe-go/v79/webhook"
 	"go.mongodb.org/mongo-driver/bson"
 
@@ -120,12 +121,57 @@ func handleCheckoutCompleted(ctx context.Context, mongo *db.Mongo, ev stripe.Eve
 		return err
 	}
 
-	// Persist the subscription id so the portal + webhooks can correlate.
+	updates := bson.M{
+		"stripe_subscription_id": sess.Subscription.ID,
+	}
+
+	// 1st choice: session-level metadata (set explicitly in checkout params).
+	planSlug := sess.Metadata["plan"]
+
+	// 2nd choice: subscription metadata from the embedded object (usually empty
+	// in the webhook payload since it's not expanded — but worth checking).
+	if planSlug == "" && sess.Subscription.Metadata != nil {
+		planSlug = sess.Subscription.Metadata["plan"]
+	}
+
+	// 3rd choice: fetch the full subscription from Stripe API.
+	// This is the reliable fallback — the subscription carries the metadata
+	// we set in SubscriptionData.Metadata when creating the checkout session.
+	if planSlug == "" {
+		fullSub, apiErr := stripesub.Get(sess.Subscription.ID, nil)
+		if apiErr == nil && fullSub != nil {
+			planSlug = fullSub.Metadata["plan"]
+			// While we have the full sub, run syncSubscription to capture all
+			// fields (period end, status, etc.) in one shot.
+			if syncErr := syncSubscription(ctx, mongo, t.ID, fullSub); syncErr != nil {
+				log.Printf("[stripe webhook] syncSubscription after checkout: %v", syncErr)
+			}
+		} else {
+			log.Printf("[stripe webhook] could not fetch subscription %s: %v", sess.Subscription.ID, apiErr)
+		}
+	}
+
+	if planSlug != "" {
+		updates["plan"] = planSlug
+		log.Printf("[stripe webhook] checkout completed: tenant=%s plan=%s", t.ID, planSlug)
+	} else {
+		log.Printf("[stripe webhook] checkout completed: tenant=%s — plan slug not found in metadata", t.ID)
+	}
+
+	// Seed a basic subscription doc so the billing page shows the cancel
+	// button immediately on redirect-back, before customer.subscription.created
+	// arrives and fills in the full details.
+	now := time.Now().UTC()
+	merged := mergedSubscription(t.Subscription)
+	if merged.Status != models.SubStatusActive && merged.Status != models.SubStatusTrialing {
+		merged.Status = models.SubStatusActive
+		merged.UpdatedAt = now
+		updates["subscription"] = merged
+	}
+
 	_, err = mongo.DB.Collection("tenants").UpdateOne(ctx,
 		bson.M{"_id": t.ID},
-		bson.M{"$set": bson.M{
-			"stripe_subscription_id": sess.Subscription.ID,
-		}},
+		bson.M{"$set": updates},
 	)
 	return err
 }
@@ -284,19 +330,19 @@ func syncSubscription(ctx context.Context, mongo *db.Mongo, tenantID string, sub
 	merged.CancelAtPeriodEnd = sub.CancelAtPeriodEnd
 	merged.UpdatedAt = time.Now().UTC()
 
-	// Also update the plan field if Stripe exposes one through the
-	// subscription's first item — keeps our UI labels in sync with the
-	// price the customer is actually paying.
+	// Resolve the plan slug — check subscription metadata first (set by our
+	// checkout session), then fall back to price metadata.
+	planSlug := sub.Metadata["plan"]
+	if planSlug == "" && sub.Items != nil && len(sub.Items.Data) > 0 && sub.Items.Data[0].Price != nil {
+		planSlug = sub.Items.Data[0].Price.Metadata["plan"]
+	}
+
 	updates := bson.M{
 		"subscription":           merged,
 		"stripe_subscription_id": sub.ID,
 	}
-	if sub.Items != nil && len(sub.Items.Data) > 0 && sub.Items.Data[0].Price != nil {
-		// Look up the metadata "plan" field on the price; if missing, keep
-		// whatever we have. Set on the price in Stripe Dashboard or via API.
-		if plan := sub.Items.Data[0].Price.Metadata["plan"]; plan != "" {
-			updates["plan"] = plan
-		}
+	if planSlug != "" {
+		updates["plan"] = planSlug
 	}
 
 	_, err := mongo.DB.Collection("tenants").UpdateOne(ctx,

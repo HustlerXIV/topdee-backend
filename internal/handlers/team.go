@@ -15,6 +15,7 @@ package handlers
 // feature.)
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/base64"
 	"fmt"
@@ -322,26 +323,82 @@ func (h *TeamHandler) ResendInvite(c *fiber.Ctx) error {
 
 	acceptURL := h.cfg.AcceptInviteBaseURL + "?token=" + inv.Token
 
+	// Capture all values from the Fiber context NOW, before the handler
+	// returns and Fiber recycles c. Accessing c inside a goroutine is a
+	// data race / nil-pointer panic.
+	inviterEmail := middleware.Email(c)
+	invEmail := inv.Email
+	invExpiresAt := inv.ExpiresAt
+
 	// Re-send email — look up workspace name for the template.
 	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
 		var tenant models.Tenant
 		if err := h.mongo.DB.Collection("tenants").
-			FindOne(c.Context(), bson.M{"_id": tid}).Decode(&tenant); err != nil {
+			FindOne(ctx, bson.M{"_id": tid}).Decode(&tenant); err != nil {
 			return
 		}
-		inviterEmail := middleware.Email(c)
 		subject := fmt.Sprintf("You're invited to join %s on Topdee", tenant.Name)
-		html := email.InviteHTML(tenant.Name, inviterEmail, acceptURL, inv.ExpiresAt)
-		if err := h.mailer.Send(inv.Email, subject, html); err != nil {
-			log.Printf("[invite] resend email to %s failed: %v", inv.Email, err)
+		html := email.InviteHTML(tenant.Name, inviterEmail, acceptURL, invExpiresAt)
+		if err := h.mailer.Send(invEmail, subject, html); err != nil {
+			log.Printf("[invite] resend email to %s failed: %v", invEmail, err)
 		} else {
-			log.Printf("[invite] resend email sent to %s", inv.Email)
+			log.Printf("[invite] resend email sent to %s", invEmail)
 		}
 	}()
 
 	return c.JSON(createInviteResp{
 		Invite:    inv,
 		AcceptURL: acceptURL,
+	})
+}
+
+// ── Invite info (public) ───────────────────────────────────────────────
+
+type inviteInfoResp struct {
+	Email         string `json:"email"`
+	WorkspaceName string `json:"workspace_name"`
+	InviterEmail  string `json:"inviter_email"`
+	ExpiresAt     string `json:"expires_at"`
+}
+
+// GET /api/v1/auth/invite-info?token=... — public, no auth.
+//
+// Returns just enough metadata for the accept-invite page to show "you were
+// invited to <workspace> as <email>" before the user fills in their password.
+func (h *TeamHandler) InviteInfo(c *fiber.Ctx) error {
+	token := c.Query("token")
+	if token == "" {
+		return fiber.NewError(fiber.StatusBadRequest, "token required")
+	}
+
+	var inv models.TeamInvite
+	if err := h.mongo.DB.Collection("team_invites").
+		FindOne(c.Context(), bson.M{"token": token}).Decode(&inv); err != nil {
+		return fiber.NewError(fiber.StatusNotFound, "invite not found")
+	}
+	if inv.Status != models.InviteStatusPending {
+		return fiber.NewError(fiber.StatusGone, "invite is "+inv.Status)
+	}
+	if time.Now().UTC().After(inv.ExpiresAt) {
+		return fiber.NewError(fiber.StatusGone, "invite expired")
+	}
+
+	// Look up workspace name + inviter email for display.
+	var tenant models.Tenant
+	_ = h.mongo.DB.Collection("tenants").
+		FindOne(c.Context(), bson.M{"_id": inv.TenantID}).Decode(&tenant)
+
+	var inviter models.User
+	_ = h.mongo.DB.Collection("users").
+		FindOne(c.Context(), bson.M{"_id": inv.InvitedBy}).Decode(&inviter)
+
+	return c.JSON(inviteInfoResp{
+		Email:         inv.Email,
+		WorkspaceName: tenant.Name,
+		InviterEmail:  inviter.Email,
+		ExpiresAt:     inv.ExpiresAt.Format("2 January 2006"),
 	})
 }
 

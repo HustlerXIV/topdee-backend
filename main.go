@@ -79,8 +79,9 @@ func main() {
 	app.Use(recover.New())
 	app.Use(logger.New())
 	app.Use(cors.New(cors.Config{
-		AllowOrigins: "*",
+		AllowOrigins: cfg.AllowOrigins,
 		AllowHeaders: "Origin, Content-Type, Accept, Authorization",
+		AllowMethods: "GET, POST, PUT, PATCH, DELETE, OPTIONS",
 	}))
 
 	// public
@@ -179,6 +180,10 @@ func main() {
 	protected.Get("/channels/facebook/oauth/pages", chH.FacebookOAuthPages)
 	protected.Post("/channels/facebook/oauth/connect", chH.FacebookOAuthConnect)
 
+	// Analytics — real stats from the messages collection.
+	analyticsH := handlers.NewAnalyticsHandler(mongo)
+	protected.Get("/analytics", analyticsH.GetStats)
+
 	// Playground (in-dashboard test chat)
 	pgH := handlers.NewPlaygroundHandler(orch, mongo)
 	protected.Post("/playground/chat", pgH.Send)
@@ -206,6 +211,7 @@ func main() {
 	protected.Post("/billing/cancel", billingH.CancelSubscription)
 	protected.Post("/billing/reactivate", billingH.ReactivateSubscription)
 	protected.Post("/billing/sync-session", billingH.SyncCheckoutSession)
+	protected.Post("/billing/promptpay-checkout", billingH.CreatePromptPayCheckout)
 	protected.Get("/billing/invoices", billingH.ListInvoices)
 
 	// Public webhooks (secured by signature verification). The generic

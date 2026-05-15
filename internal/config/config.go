@@ -79,6 +79,11 @@ type Config struct {
 	StripeSecretKey     string
 	StripeWebhookSecret string
 	BillingReturnURL    string // where Checkout + Portal redirect back to
+
+	// CORS_ALLOW_ORIGINS — comma-separated list of allowed origins.
+	// Use "*" for development, your frontend domain in production.
+	// e.g. "https://topdee.com"
+	AllowOrigins string
 }
 
 func Load() (*Config, error) {
@@ -113,6 +118,8 @@ func Load() (*Config, error) {
 		StripeSecretKey:     getEnv("STRIPE_SECRET_KEY", ""),
 		StripeWebhookSecret: getEnv("STRIPE_WEBHOOK_SECRET", ""),
 		BillingReturnURL:    getEnv("BILLING_RETURN_URL", "http://localhost:3000/billing"),
+
+		AllowOrigins: getEnv("CORS_ALLOW_ORIGINS", "*"),
 	}
 	ttl, _ := strconv.Atoi(getEnv("JWT_TTL_HOURS", "24"))
 	if ttl <= 0 {

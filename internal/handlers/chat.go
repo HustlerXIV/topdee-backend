@@ -9,6 +9,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"regexp"
 	"strings"
 	"time"
@@ -21,6 +22,7 @@ import (
 	"github.com/topdee/backend/internal/clients"
 	"github.com/topdee/backend/internal/config"
 	"github.com/topdee/backend/internal/db"
+	"github.com/topdee/backend/internal/email"
 	"github.com/topdee/backend/internal/middleware"
 	"github.com/topdee/backend/internal/models"
 )
@@ -71,10 +73,11 @@ func stripSourceMentions(s string) string {
 }
 
 type Orchestrator struct {
-	mongo *db.Mongo
-	ai    *clients.AIClient
-	cfg   *config.Config
-	hub   hubBroadcaster
+	mongo  *db.Mongo
+	ai     *clients.AIClient
+	cfg    *config.Config
+	hub    hubBroadcaster
+	mailer *email.Mailer
 }
 
 // hubBroadcaster is the subset of realtime.Hub that the orchestrator needs.
@@ -92,7 +95,66 @@ type runtimeBotSettings struct {
 }
 
 func NewOrchestrator(m *db.Mongo, ai *clients.AIClient, cfg *config.Config, hub hubBroadcaster) *Orchestrator {
-	return &Orchestrator{mongo: m, ai: ai, cfg: cfg, hub: hub}
+	return &Orchestrator{
+		mongo: m,
+		ai:    ai,
+		cfg:   cfg,
+		hub:   hub,
+		mailer: &email.Mailer{
+			APIKey: cfg.ResendAPIKey,
+			From:   cfg.EmailFrom,
+		},
+	}
+}
+
+// notifyUsers fetches non-suspended users in the tenant whose role is in
+// `roles` AND who have the given notification preference enabled, then sends
+// each an email. Fire-and-forget: errors are logged but never bubble up.
+//
+// prefKey must match a field name in NotificationPrefs:
+//   "new_chat" | "ai_cant_answer" | "quota_warning" | "daily_summary"
+//
+// Users who have never saved prefs (notif_prefs is absent) are treated as
+// having all notifications enabled (the default for new users).
+func (o *Orchestrator) notifyUsers(ctx context.Context, tenantID string, roles []string, prefKey, subject, html string) {
+	if o.mailer.APIKey == "" {
+		return // email not configured
+	}
+
+	// A user should receive the notification if:
+	//   (a) they have no notif_prefs doc at all  →  treat as all-enabled, OR
+	//   (b) their notif_prefs.<prefKey> == true
+	prefField := "notif_prefs." + prefKey
+	filter := bson.M{
+		"tenant_id": tenantID,
+		"role":      bson.M{"$in": roles},
+		"suspended": bson.M{"$ne": true},
+		"$or": []bson.M{
+			{prefField: true},
+			{"notif_prefs": bson.M{"$exists": false}},
+		},
+	}
+
+	cur, err := o.mongo.DB.Collection("users").Find(ctx, filter)
+	if err != nil {
+		log.Printf("[notify] query users: %v", err)
+		return
+	}
+	var users []struct {
+		Email string `bson:"email"`
+	}
+	if err := cur.All(ctx, &users); err != nil {
+		log.Printf("[notify] decode users: %v", err)
+		return
+	}
+	for _, u := range users {
+		if u.Email == "" {
+			continue
+		}
+		if err := o.mailer.Send(u.Email, subject, html); err != nil {
+			log.Printf("[notify] send to %s: %v", u.Email, err)
+		}
+	}
 }
 
 // HandleIncoming runs the platform-agent pipeline for a single inbound message
@@ -151,6 +213,21 @@ func (o *Orchestrator) HandleIncoming(
 	}
 	if _, err := o.mongo.DB.Collection("messages").InsertOne(ctx, userMsg); err != nil {
 		return "", nil, conversationID, err
+	}
+
+	// ── New-chat notification ─────────────────────────────────────────────────
+	// Fire once per conversation (only when history was empty = first message).
+	// Sent to Owner + Admin + Agent on real customer channels.
+	if channel != models.ChannelDashboard && len(history) == 0 {
+		tenantName := tenant.Name
+		preview := content
+		go o.notifyUsers(
+			context.Background(), tenantID,
+			[]string{"owner", "admin", "agent"},
+			"new_chat",
+			"💬 New message from a customer — "+tenantName,
+			email.NewChatHTML(tenantName, externalUserID, preview, channel),
+		)
 	}
 
 	if bot.mode == "manual" || strings.TrimSpace(message) == "" {
@@ -300,10 +377,26 @@ func shouldHandoff(customerMsg, aiReply string) bool {
 // flagHandoff upserts a conversation document with needs_human=true so the
 // inbox list can surface this conversation in the "รอทีม" tab, then
 // immediately broadcasts an inbox_update so the sidebar badge refreshes.
+// The "AI couldn't answer" email is sent only the FIRST time needs_human is
+// set for this conversation (deduplicated: if already true, email is skipped).
 func (o *Orchestrator) flagHandoff(tenantID, conversationID string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	now := time.Now().UTC()
+
+	// Check whether needs_human was already set. If the doc doesn't exist OR
+	// it exists with needs_human==false, this is a new handoff.
+	var existing struct {
+		NeedsHuman bool   `bson:"needs_human"`
+		Channel    string `bson:"channel"`
+	}
+	isNew := true
+	if err := o.mongo.DB.Collection("conversations").
+		FindOne(ctx, bson.M{"_id": conversationID, "tenant_id": tenantID}).
+		Decode(&existing); err == nil && existing.NeedsHuman {
+		isNew = false
+	}
+
 	_, _ = o.mongo.DB.Collection("conversations").UpdateOne(
 		ctx,
 		bson.M{"_id": conversationID, "tenant_id": tenantID},
@@ -320,6 +413,37 @@ func (o *Orchestrator) flagHandoff(tenantID, conversationID string) {
 		},
 		options.Update().SetUpsert(true),
 	)
+
+	// Send "AI couldn't answer" email on the first handoff for this conversation.
+	if isNew {
+		// Fetch the tenant name and last customer message for context.
+		var t models.Tenant
+		_ = o.mongo.DB.Collection("tenants").
+			FindOne(ctx, bson.M{"_id": tenantID}).Decode(&t)
+
+		var lastMsg struct {
+			Content        string `bson:"content"`
+			Channel        string `bson:"channel"`
+			ExternalUserID string `bson:"external_user_id"`
+		}
+		_ = o.mongo.DB.Collection("messages").FindOne(
+			ctx,
+			bson.M{
+				"tenant_id":       tenantID,
+				"conversation_id": conversationID,
+				"role":            models.RoleUser,
+			},
+			options.FindOne().SetSort(bson.D{{Key: "created_at", Value: -1}}),
+		).Decode(&lastMsg)
+
+		go o.notifyUsers(
+			context.Background(), tenantID,
+			[]string{"owner", "admin", "agent"},
+			"ai_cant_answer",
+			"⚠ AI couldn't answer — customer needs help ("+t.Name+")",
+			email.AICantAnswerHTML(t.Name, lastMsg.ExternalUserID, lastMsg.Content, lastMsg.Channel),
+		)
+	}
 
 	// Push an updated unread count to all open dashboard tabs so the inbox
 	// badge increments without requiring a page reload.
@@ -843,11 +967,9 @@ func (o *Orchestrator) checkMonthlyQuota(ctx context.Context, tenant models.Tena
 		"created_at": bson.M{"$gte": startOfMonth},
 	})
 
-	if int(used) <= limit {
-		return false, ""
-	}
-
-	// Limit exceeded — find the next public plan above this one.
+	// ── 80% warning ──────────────────────────────────────────────────────────
+	// Find the next plan name first (needed for both the warning email and the
+	// quota-exceeded message).
 	nextPlanName := ""
 	var next struct {
 		DisplayName string `bson:"display_name"`
@@ -862,6 +984,28 @@ func (o *Orchestrator) checkMonthlyQuota(ctx context.Context, tenant models.Tena
 		options.FindOne().SetSort(bson.D{{Key: "sort_order", Value: 1}}),
 	).Decode(&next); err == nil {
 		nextPlanName = next.DisplayName
+	}
+
+	warningThreshold := int64(float64(limit) * 0.8)
+	currentMonth := now.Format("2006-01")
+	if used >= warningThreshold && int(used) <= limit && tenant.QuotaWarnMonth != currentMonth {
+		// Mark as warned for this month so we don't spam.
+		_, _ = o.mongo.DB.Collection("tenants").UpdateOne(
+			tctx,
+			bson.M{"_id": tenant.ID},
+			bson.M{"$set": bson.M{"quota_warn_month": currentMonth}},
+		)
+		go o.notifyUsers(
+			context.Background(), tenant.ID,
+			[]string{"owner"},
+			"quota_warning",
+			fmt.Sprintf("⚡ %d%% of monthly AI quota used — %s", int(used)*100/limit, tenant.Name),
+			email.QuotaWarningHTML(tenant.Name, int(used), limit, nextPlanName),
+		)
+	}
+
+	if int(used) <= limit {
+		return false, ""
 	}
 
 	return true, buildQuotaMessage(limit, nextPlanName)

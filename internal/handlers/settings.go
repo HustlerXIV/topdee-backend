@@ -33,14 +33,22 @@ func NewSettingsHandler(m *db.Mongo, cfg ...*config.Config) *SettingsHandler {
 }
 
 type settingsView struct {
-	Account   accountSettingsView   `json:"account"`
-	Workspace workspaceSettingsView `json:"workspace"`
+	Account      accountSettingsView      `json:"account"`
+	Workspace    workspaceSettingsView    `json:"workspace"`
+	Notification notificationSettingsView `json:"notification"`
 }
 
 type accountSettingsView struct {
 	Name  string `json:"name"`
 	Email string `json:"email"`
 	Role  string `json:"role"`
+}
+
+type notificationSettingsView struct {
+	NewChat      bool `json:"new_chat"`
+	AICantAnswer bool `json:"ai_cant_answer"`
+	QuotaWarning bool `json:"quota_warning"`
+	DailySummary bool `json:"daily_summary"`
 }
 
 type workspaceSettingsView struct {
@@ -68,8 +76,9 @@ func (h *SettingsHandler) Get(c *fiber.Ctx) error {
 	}
 
 	return c.JSON(settingsView{
-		Account:   accountView(u),
-		Workspace: workspaceView(t),
+		Account:      accountView(u),
+		Workspace:    workspaceView(t),
+		Notification: notifView(u),
 	})
 }
 
@@ -216,6 +225,63 @@ func (h *SettingsHandler) UpdateWorkspace(c *fiber.Ctx) error {
 
 func accountView(u models.User) accountSettingsView {
 	return accountSettingsView{Name: u.Name, Email: u.Email, Role: u.Role}
+}
+
+// notifView returns the notification preferences for a user.
+// When the user has never saved prefs (nil), all defaults are true.
+func notifView(u models.User) notificationSettingsView {
+	p := models.DefaultNotifPrefs()
+	if u.NotifPrefs != nil {
+		p = *u.NotifPrefs
+	}
+	return notificationSettingsView{
+		NewChat:      p.NewChat,
+		AICantAnswer: p.AICantAnswer,
+		QuotaWarning: p.QuotaWarning,
+		DailySummary: p.DailySummary,
+	}
+}
+
+type updateNotificationsReq struct {
+	NewChat      bool `json:"new_chat"`
+	AICantAnswer bool `json:"ai_cant_answer"`
+	QuotaWarning bool `json:"quota_warning"`
+	DailySummary bool `json:"daily_summary"`
+}
+
+// UpdateNotifications handles PATCH /api/v1/settings/notifications.
+// Saves the caller's personal email notification preferences.
+func (h *SettingsHandler) UpdateNotifications(c *fiber.Ctx) error {
+	uid := middleware.UserID(c)
+	tid := middleware.TenantID(c)
+
+	var req updateNotificationsReq
+	if err := c.BodyParser(&req); err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid body")
+	}
+
+	prefs := models.NotificationPrefs{
+		NewChat:      req.NewChat,
+		AICantAnswer: req.AICantAnswer,
+		QuotaWarning: req.QuotaWarning,
+		DailySummary: req.DailySummary,
+	}
+
+	_, err := h.mongo.DB.Collection("users").UpdateOne(
+		c.Context(),
+		bson.M{"_id": uid, "tenant_id": tid},
+		bson.M{"$set": bson.M{"notif_prefs": prefs}},
+	)
+	if err != nil {
+		return err
+	}
+
+	return c.JSON(notificationSettingsView{
+		NewChat:      prefs.NewChat,
+		AICantAnswer: prefs.AICantAnswer,
+		QuotaWarning: prefs.QuotaWarning,
+		DailySummary: prefs.DailySummary,
+	})
 }
 
 func workspaceView(t models.Tenant) workspaceSettingsView {

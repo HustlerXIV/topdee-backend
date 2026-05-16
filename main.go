@@ -157,6 +157,7 @@ func main() {
 	protected.Patch("/settings/password", settingsH.UpdatePassword)
 	protected.Patch("/settings/workspace", settingsH.UpdateWorkspace)
 	protected.Post("/settings/workspace/logo", settingsH.UploadLogo)
+	protected.Patch("/settings/notifications", settingsH.UpdateNotifications)
 
 	// Team — members + invites. Anyone in the workspace can list members,
 	// but write operations are gated to owner/admin via RequireRole.

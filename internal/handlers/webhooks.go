@@ -186,6 +186,7 @@ func processEvents(
 
 // broadcastInboxUpdate recomputes the unread count for a tenant and pushes
 // an inbox_update event to all connected dashboard tabs via the Hub.
+// Counts conversations where the customer spoke last OR needs_human is set.
 func broadcastInboxUpdate(hub *realtime.Hub, m *db.Mongo, tenantID string) {
 	if hub == nil {
 		return
@@ -203,7 +204,25 @@ func broadcastInboxUpdate(hub *realtime.Hub, m *db.Mongo, tenantID string) {
 			"_id":              "$conversation_id",
 			"last_sender_role": bson.M{"$first": "$role"},
 		}},
-		{"$match": bson.M{"last_sender_role": models.RoleUser}},
+		{"$lookup": bson.M{
+			"from":         "conversations",
+			"localField":   "_id",
+			"foreignField": "_id",
+			"as":           "conv_meta",
+		}},
+		{"$addFields": bson.M{
+			"needs_human": bson.M{
+				"$cond": []any{
+					bson.M{"$gt": []any{bson.M{"$size": "$conv_meta"}, 0}},
+					bson.M{"$arrayElemAt": []any{"$conv_meta.needs_human", 0}},
+					false,
+				},
+			},
+		}},
+		{"$match": bson.M{"$or": []bson.M{
+			{"last_sender_role": models.RoleUser},
+			{"needs_human": true},
+		}}},
 		{"$count": "count"},
 	}
 

@@ -91,6 +91,7 @@ type BusinessHours struct {
 type Tenant struct {
 	ID           string `bson:"_id" json:"id"`
 	Name         string `bson:"name" json:"name"`
+	LogoURL      string `bson:"logo_url,omitempty" json:"logo_url,omitempty"`
 	Timezone     string `bson:"timezone,omitempty" json:"timezone,omitempty"`
 	Website      string `bson:"website,omitempty" json:"website,omitempty"`
 	BusinessType string `bson:"business_type,omitempty" json:"business_type,omitempty"`

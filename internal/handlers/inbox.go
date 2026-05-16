@@ -50,10 +50,21 @@ func NewInboxHandler(m *db.Mongo, reg *channels.Registry, store *channels.Store,
 // GET /api/v1/inbox/unread-count → { "count": 7 }
 func (h *InboxHandler) UnreadCount(c *fiber.Ctx) error {
 	tid := middleware.TenantID(c)
+	count, err := h.computeUnread(c.Context(), tid)
+	if err != nil {
+		return err
+	}
+	return c.JSON(fiber.Map{"count": count})
+}
 
+// computeUnread returns the number of conversations that need team attention:
+// either the customer spoke last (waiting for any reply) OR the conversation
+// has been flagged needs_human=true (AI couldn't answer / customer asked for
+// a human — even though the AI already sent a message).
+func (h *InboxHandler) computeUnread(ctx context.Context, tenantID string) (int, error) {
 	pipeline := []bson.M{
 		{"$match": bson.M{
-			"tenant_id": tid,
+			"tenant_id": tenantID,
 			"channel":   bson.M{"$ne": models.ChannelDashboard},
 		}},
 		{"$sort": bson.M{"created_at": -1}},
@@ -61,28 +72,44 @@ func (h *InboxHandler) UnreadCount(c *fiber.Ctx) error {
 			"_id":              "$conversation_id",
 			"last_sender_role": bson.M{"$first": "$role"},
 		}},
-		// "user" role = inbound customer message. If the last message is
-		// from the customer, nobody has replied yet → needs attention.
-		{"$match": bson.M{"last_sender_role": models.RoleUser}},
+		// Join the conversations collection to pick up the needs_human flag.
+		{"$lookup": bson.M{
+			"from":         "conversations",
+			"localField":   "_id",
+			"foreignField": "_id",
+			"as":           "conv_meta",
+		}},
+		{"$addFields": bson.M{
+			"needs_human": bson.M{
+				"$cond": []any{
+					bson.M{"$gt": []any{bson.M{"$size": "$conv_meta"}, 0}},
+					bson.M{"$arrayElemAt": []any{"$conv_meta.needs_human", 0}},
+					false,
+				},
+			},
+		}},
+		// Count when: customer spoke last OR handoff is pending.
+		{"$match": bson.M{"$or": []bson.M{
+			{"last_sender_role": models.RoleUser},
+			{"needs_human": true},
+		}}},
 		{"$count": "count"},
 	}
 
-	cur, err := h.mongo.DB.Collection("messages").Aggregate(c.Context(), pipeline)
+	cur, err := h.mongo.DB.Collection("messages").Aggregate(ctx, pipeline)
 	if err != nil {
-		return err
+		return 0, err
 	}
-	defer cur.Close(c.Context())
+	defer cur.Close(ctx)
 
 	var result []struct {
 		Count int `bson:"count"`
 	}
-	_ = cur.All(c.Context(), &result)
-
-	count := 0
+	_ = cur.All(ctx, &result)
 	if len(result) > 0 {
-		count = result[0].Count
+		return result[0].Count, nil
 	}
-	return c.JSON(fiber.Map{"count": count})
+	return 0, nil
 }
 
 // broadcastUnread recomputes the unread count for a tenant and pushes an
@@ -94,34 +121,9 @@ func (h *InboxHandler) broadcastUnread(tenantID string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	pipeline := []bson.M{
-		{"$match": bson.M{
-			"tenant_id": tenantID,
-			"channel":   bson.M{"$ne": models.ChannelDashboard},
-		}},
-		{"$sort": bson.M{"created_at": -1}},
-		{"$group": bson.M{
-			"_id":              "$conversation_id",
-			"last_sender_role": bson.M{"$first": "$role"},
-		}},
-		{"$match": bson.M{"last_sender_role": models.RoleUser}},
-		{"$count": "count"},
-	}
-
-	cur, err := h.mongo.DB.Collection("messages").Aggregate(ctx, pipeline)
+	count, err := h.computeUnread(ctx, tenantID)
 	if err != nil {
 		return
-	}
-	defer cur.Close(ctx)
-
-	var result []struct {
-		Count int `bson:"count"`
-	}
-	_ = cur.All(ctx, &result)
-
-	count := 0
-	if len(result) > 0 {
-		count = result[0].Count
 	}
 	h.hub.Broadcast(tenantID, map[string]any{
 		"type":  "inbox_update",
@@ -145,7 +147,8 @@ func (h *InboxHandler) resolveCustomerName(ctx context.Context, channel, externa
 }
 
 // inboxConversationView — one row in the inbox list. Computed from the
-// messages collection on every request (no separate conversations table).
+// messages collection on every request, enriched with per-conversation
+// state from the conversations collection (needs_human flag, etc.).
 type inboxConversationView struct {
 	ID             string    `json:"id"`
 	Channel        string    `json:"channel"`
@@ -155,6 +158,7 @@ type inboxConversationView struct {
 	LastMessageAt  time.Time `json:"last_message_at"`
 	LastSenderRole string    `json:"last_sender_role"`
 	MessageCount   int       `json:"message_count"`
+	NeedsHuman     bool      `json:"needs_human"`
 }
 
 // ListConversations aggregates messages by conversation_id and returns one
@@ -195,6 +199,24 @@ func (h *InboxHandler) ListConversations(c *fiber.Ctx) error {
 			"last_sender_role": bson.M{"$first": "$role"},
 			"message_count":    bson.M{"$sum": 1},
 		}},
+		// Join the conversations collection to pick up the needs_human flag.
+		// A $lookup on a non-existent document simply returns an empty array,
+		// so rows without a conversation doc default to needs_human=false below.
+		{"$lookup": bson.M{
+			"from":         "conversations",
+			"localField":   "_id",
+			"foreignField": "_id",
+			"as":           "conv_meta",
+		}},
+		{"$addFields": bson.M{
+			"needs_human": bson.M{
+				"$cond": []any{
+					bson.M{"$gt": []any{bson.M{"$size": "$conv_meta"}, 0}},
+					bson.M{"$arrayElemAt": []any{"$conv_meta.needs_human", 0}},
+					false,
+				},
+			},
+		}},
 		{"$sort": bson.M{"last_message_at": -1}},
 		{"$limit": 200},
 	}
@@ -213,6 +235,7 @@ func (h *InboxHandler) ListConversations(c *fiber.Ctx) error {
 		LastMessageAt  time.Time `bson:"last_message_at"`
 		LastSenderRole string    `bson:"last_sender_role"`
 		MessageCount   int       `bson:"message_count"`
+		NeedsHuman     bool      `bson:"needs_human"`
 	}
 	var rows []aggRow
 	if err := cur.All(c.Context(), &rows); err != nil {
@@ -238,9 +261,53 @@ func (h *InboxHandler) ListConversations(c *fiber.Ctx) error {
 			LastMessageAt:  r.LastMessageAt,
 			LastSenderRole: r.LastSenderRole,
 			MessageCount:   r.MessageCount,
+			NeedsHuman:     r.NeedsHuman,
 		})
 	}
 	return c.JSON(out)
+}
+
+// ResolveHandoff clears the needs_human flag on a conversation, moving it back
+// to normal AI-handled flow.  Called when a team member has taken over and
+// resolved the customer's question.
+//
+// PATCH /api/v1/inbox/conversations/:id/resolve → 204
+func (h *InboxHandler) ResolveHandoff(c *fiber.Ctx) error {
+	tid := middleware.TenantID(c)
+	convID := conversationIDParam(c)
+	if convID == "" {
+		return fiber.NewError(fiber.StatusBadRequest, "missing conversation id")
+	}
+
+	// Sanity check: at least one message from this tenant must exist for
+	// this conversation_id (prevents tenants from resolving each other's chats).
+	count, err := h.mongo.DB.Collection("messages").CountDocuments(
+		c.Context(),
+		bson.M{"tenant_id": tid, "conversation_id": convID},
+	)
+	if err != nil {
+		return err
+	}
+	if count == 0 {
+		return fiber.NewError(fiber.StatusNotFound, "conversation not found")
+	}
+
+	now := time.Now().UTC()
+	_, err = h.mongo.DB.Collection("conversations").UpdateOne(
+		c.Context(),
+		bson.M{"_id": convID, "tenant_id": tid},
+		bson.M{"$set": bson.M{
+			"needs_human": false,
+			"resolved_at": now,
+			"updated_at":  now,
+		}},
+	)
+	if err != nil {
+		return err
+	}
+
+	go h.broadcastUnread(tid)
+	return c.SendStatus(fiber.StatusNoContent)
 }
 
 // GetMessages returns every message in one conversation, oldest first, up

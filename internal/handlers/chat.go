@@ -9,6 +9,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"regexp"
 	"strings"
 	"time"
@@ -21,6 +22,7 @@ import (
 	"github.com/topdee/backend/internal/clients"
 	"github.com/topdee/backend/internal/config"
 	"github.com/topdee/backend/internal/db"
+	"github.com/topdee/backend/internal/email"
 	"github.com/topdee/backend/internal/middleware"
 	"github.com/topdee/backend/internal/models"
 )
@@ -71,9 +73,18 @@ func stripSourceMentions(s string) string {
 }
 
 type Orchestrator struct {
-	mongo *db.Mongo
-	ai    *clients.AIClient
-	cfg   *config.Config
+	mongo  *db.Mongo
+	ai     *clients.AIClient
+	cfg    *config.Config
+	hub    hubBroadcaster
+	mailer *email.Mailer
+}
+
+// hubBroadcaster is the subset of realtime.Hub that the orchestrator needs.
+// Using an interface keeps the import cycle-free and makes the orchestrator
+// easy to test without a real Hub.
+type hubBroadcaster interface {
+	Broadcast(tenantID string, payload any)
 }
 
 type runtimeBotSettings struct {
@@ -83,8 +94,67 @@ type runtimeBotSettings struct {
 	mode         string
 }
 
-func NewOrchestrator(m *db.Mongo, ai *clients.AIClient, cfg *config.Config) *Orchestrator {
-	return &Orchestrator{mongo: m, ai: ai, cfg: cfg}
+func NewOrchestrator(m *db.Mongo, ai *clients.AIClient, cfg *config.Config, hub hubBroadcaster) *Orchestrator {
+	return &Orchestrator{
+		mongo: m,
+		ai:    ai,
+		cfg:   cfg,
+		hub:   hub,
+		mailer: &email.Mailer{
+			APIKey: cfg.ResendAPIKey,
+			From:   cfg.EmailFrom,
+		},
+	}
+}
+
+// notifyUsers fetches non-suspended users in the tenant whose role is in
+// `roles` AND who have the given notification preference enabled, then sends
+// each an email. Fire-and-forget: errors are logged but never bubble up.
+//
+// prefKey must match a field name in NotificationPrefs:
+//   "new_chat" | "ai_cant_answer" | "quota_warning" | "daily_summary"
+//
+// Users who have never saved prefs (notif_prefs is absent) are treated as
+// having all notifications enabled (the default for new users).
+func (o *Orchestrator) notifyUsers(ctx context.Context, tenantID string, roles []string, prefKey, subject, html string) {
+	if o.mailer.APIKey == "" {
+		return // email not configured
+	}
+
+	// A user should receive the notification if:
+	//   (a) they have no notif_prefs doc at all  →  treat as all-enabled, OR
+	//   (b) their notif_prefs.<prefKey> == true
+	prefField := "notif_prefs." + prefKey
+	filter := bson.M{
+		"tenant_id": tenantID,
+		"role":      bson.M{"$in": roles},
+		"suspended": bson.M{"$ne": true},
+		"$or": []bson.M{
+			{prefField: true},
+			{"notif_prefs": bson.M{"$exists": false}},
+		},
+	}
+
+	cur, err := o.mongo.DB.Collection("users").Find(ctx, filter)
+	if err != nil {
+		log.Printf("[notify] query users: %v", err)
+		return
+	}
+	var users []struct {
+		Email string `bson:"email"`
+	}
+	if err := cur.All(ctx, &users); err != nil {
+		log.Printf("[notify] decode users: %v", err)
+		return
+	}
+	for _, u := range users {
+		if u.Email == "" {
+			continue
+		}
+		if err := o.mailer.Send(u.Email, subject, html); err != nil {
+			log.Printf("[notify] send to %s: %v", u.Email, err)
+		}
+	}
 }
 
 // HandleIncoming runs the platform-agent pipeline for a single inbound message
@@ -143,6 +213,21 @@ func (o *Orchestrator) HandleIncoming(
 	}
 	if _, err := o.mongo.DB.Collection("messages").InsertOne(ctx, userMsg); err != nil {
 		return "", nil, conversationID, err
+	}
+
+	// ── New-chat notification ─────────────────────────────────────────────────
+	// Fire once per conversation (only when history was empty = first message).
+	// Sent to Owner + Admin + Agent on real customer channels.
+	if channel != models.ChannelDashboard && len(history) == 0 {
+		tenantName := tenant.Name
+		preview := content
+		go o.notifyUsers(
+			context.Background(), tenantID,
+			[]string{"owner", "admin", "agent"},
+			"new_chat",
+			"💬 New message from a customer — "+tenantName,
+			email.NewChatHTML(tenantName, externalUserID, preview, channel),
+		)
 	}
 
 	if bot.mode == "manual" || strings.TrimSpace(message) == "" {
@@ -229,7 +314,196 @@ func (o *Orchestrator) HandleIncoming(
 	if role == models.RoleSuggestion {
 		return "", resp.Sources, conversationID, nil
 	}
+
+	// ── Human-handoff detection ───────────────────────────────────────────────
+	// On real customer channels (not the playground), check whether the AI
+	// indicated it can't answer OR the customer explicitly asked for a human.
+	// When either signal fires, upsert a conversations doc with needs_human=true
+	// and broadcast an inbox_update so the dashboard badge refreshes instantly.
+	if channel != models.ChannelDashboard {
+		if shouldHandoff(message, resp.Reply) {
+			go o.flagHandoff(tenantID, conversationID)
+		}
+	}
+
 	return resp.Reply, resp.Sources, conversationID, nil
+}
+
+// ── Handoff helpers ───────────────────────────────────────────────────────────
+
+// aiCantAnswerPhrases — substrings we look for in the AI's reply that signal
+// it doesn't have the answer and is deferring to a human.  All lowercase.
+var aiCantAnswerPhrases = []string{
+	// Thai
+	"ไม่ทราบ", "ไม่มีข้อมูล", "ไม่สามารถตอบ", "ติดต่อทีมงาน",
+	"ให้ทีมงาน", "ทีมงานของเรา", "เจ้าหน้าที่จะ", "ประสานงานกับทีม",
+	// English
+	"i don't know", "i do not know", "i'm not sure", "i am not sure",
+	"not in the context", "connect you with", "contact our team",
+	"speak with a human", "transfer to", "reach out to our",
+	"our team will", "a human agent",
+}
+
+// customerWantsHumanPhrases — substrings in the *customer's* message that
+// explicitly ask for a live agent.  All lowercase.
+var customerWantsHumanPhrases = []string{
+	// Thai
+	"คุยกับคน", "ต้องการพนักงาน", "อยากคุยกับคน",
+	"ขอคุยกับเจ้าหน้าที่", "ขอพนักงาน", "ติดต่อพนักงาน",
+	// English
+	"speak to a human", "talk to a person", "talk to an agent",
+	"human agent", "real person", "customer service",
+	"speak to someone", "want to talk to", "connect me with",
+}
+
+// shouldHandoff returns true when either the AI reply or the customer message
+// contains a handoff-signal phrase.
+func shouldHandoff(customerMsg, aiReply string) bool {
+	lowerReply := strings.ToLower(aiReply)
+	for _, p := range aiCantAnswerPhrases {
+		if strings.Contains(lowerReply, p) {
+			return true
+		}
+	}
+	lowerMsg := strings.ToLower(customerMsg)
+	for _, p := range customerWantsHumanPhrases {
+		if strings.Contains(lowerMsg, p) {
+			return true
+		}
+	}
+	return false
+}
+
+// flagHandoff upserts a conversation document with needs_human=true so the
+// inbox list can surface this conversation in the "รอทีม" tab, then
+// immediately broadcasts an inbox_update so the sidebar badge refreshes.
+// The "AI couldn't answer" email is sent only the FIRST time needs_human is
+// set for this conversation (deduplicated: if already true, email is skipped).
+func (o *Orchestrator) flagHandoff(tenantID, conversationID string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	now := time.Now().UTC()
+
+	// Check whether needs_human was already set. If the doc doesn't exist OR
+	// it exists with needs_human==false, this is a new handoff.
+	var existing struct {
+		NeedsHuman bool   `bson:"needs_human"`
+		Channel    string `bson:"channel"`
+	}
+	isNew := true
+	if err := o.mongo.DB.Collection("conversations").
+		FindOne(ctx, bson.M{"_id": conversationID, "tenant_id": tenantID}).
+		Decode(&existing); err == nil && existing.NeedsHuman {
+		isNew = false
+	}
+
+	_, _ = o.mongo.DB.Collection("conversations").UpdateOne(
+		ctx,
+		bson.M{"_id": conversationID, "tenant_id": tenantID},
+		bson.M{
+			"$set": bson.M{
+				"needs_human":    true,
+				"needs_human_at": now,
+				"updated_at":     now,
+			},
+			"$setOnInsert": bson.M{
+				"tenant_id":  tenantID,
+				"created_at": now,
+			},
+		},
+		options.Update().SetUpsert(true),
+	)
+
+	// Send "AI couldn't answer" email on the first handoff for this conversation.
+	if isNew {
+		// Fetch the tenant name and last customer message for context.
+		var t models.Tenant
+		_ = o.mongo.DB.Collection("tenants").
+			FindOne(ctx, bson.M{"_id": tenantID}).Decode(&t)
+
+		var lastMsg struct {
+			Content        string `bson:"content"`
+			Channel        string `bson:"channel"`
+			ExternalUserID string `bson:"external_user_id"`
+		}
+		_ = o.mongo.DB.Collection("messages").FindOne(
+			ctx,
+			bson.M{
+				"tenant_id":       tenantID,
+				"conversation_id": conversationID,
+				"role":            models.RoleUser,
+			},
+			options.FindOne().SetSort(bson.D{{Key: "created_at", Value: -1}}),
+		).Decode(&lastMsg)
+
+		go o.notifyUsers(
+			context.Background(), tenantID,
+			[]string{"owner", "admin", "agent"},
+			"ai_cant_answer",
+			"⚠ AI couldn't answer — customer needs help ("+t.Name+")",
+			email.AICantAnswerHTML(t.Name, lastMsg.ExternalUserID, lastMsg.Content, lastMsg.Channel),
+		)
+	}
+
+	// Push an updated unread count to all open dashboard tabs so the inbox
+	// badge increments without requiring a page reload.
+	if o.hub != nil {
+		count := o.computeUnreadCount(ctx, tenantID)
+		o.hub.Broadcast(tenantID, map[string]any{
+			"type":  "inbox_update",
+			"count": count,
+		})
+	}
+}
+
+// computeUnreadCount returns the number of conversations needing attention:
+// customer spoke last OR needs_human flag is set. Used after a handoff is
+// flagged so we can push an accurate badge count via WebSocket.
+func (o *Orchestrator) computeUnreadCount(ctx context.Context, tenantID string) int {
+	pipeline := []bson.M{
+		{"$match": bson.M{
+			"tenant_id": tenantID,
+			"channel":   bson.M{"$ne": models.ChannelDashboard},
+		}},
+		{"$sort": bson.M{"created_at": -1}},
+		{"$group": bson.M{
+			"_id":              "$conversation_id",
+			"last_sender_role": bson.M{"$first": "$role"},
+		}},
+		{"$lookup": bson.M{
+			"from":         "conversations",
+			"localField":   "_id",
+			"foreignField": "_id",
+			"as":           "conv_meta",
+		}},
+		{"$addFields": bson.M{
+			"needs_human": bson.M{
+				"$cond": []any{
+					bson.M{"$gt": []any{bson.M{"$size": "$conv_meta"}, 0}},
+					bson.M{"$arrayElemAt": []any{"$conv_meta.needs_human", 0}},
+					false,
+				},
+			},
+		}},
+		{"$match": bson.M{"$or": []bson.M{
+			{"last_sender_role": models.RoleUser},
+			{"needs_human": true},
+		}}},
+		{"$count": "count"},
+	}
+	cur, err := o.mongo.DB.Collection("messages").Aggregate(ctx, pipeline)
+	if err != nil {
+		return 0
+	}
+	defer cur.Close(ctx)
+	var result []struct {
+		Count int `bson:"count"`
+	}
+	_ = cur.All(ctx, &result)
+	if len(result) > 0 {
+		return result[0].Count
+	}
+	return 0
 }
 
 func (o *Orchestrator) loadHistory(ctx context.Context, tenantID, convID string, limit int) ([]clients.ChatMessage, error) {
@@ -289,42 +563,47 @@ func (o *Orchestrator) resolveBotSettings(ctx context.Context, tenantID string) 
 		FindOne(ctx, bson.M{"_id": tenantID}).Decode(&t); err != nil {
 		return settings
 	}
+
+	// Apply bot overrides when present. These are optional — a tenant that
+	// hasn't touched the bot settings page simply gets env defaults.
 	b := t.Bot
-	if b == nil {
-		return settings
+	if b != nil {
+		if b.SystemPrompt != "" {
+			settings.systemPrompt = b.SystemPrompt
+		}
+		if b.Model != "" {
+			settings.model = b.Model
+		}
+		if b.Temperature != nil {
+			settings.temperature = *b.Temperature
+		}
+		if b.Mode == "auto" || b.Mode == "suggest" || b.Mode == "manual" {
+			settings.mode = b.Mode
+		}
 	}
 
-	if b.SystemPrompt != "" {
-		settings.systemPrompt = b.SystemPrompt
-	}
-	if b.Model != "" {
-		settings.model = b.Model
-	}
-	if b.Temperature != nil {
-		settings.temperature = *b.Temperature
-	}
-	if b.Mode == "auto" || b.Mode == "suggest" || b.Mode == "manual" {
-		settings.mode = b.Mode
-	}
-
-	// Build the identity preamble. Each line is a directive with no ambiguity.
+	// Build the identity preamble from whatever is configured. Business hours
+	// always goes in regardless of whether the tenant has a bot doc — the
+	// schedule lives on the tenant, not on the bot settings.
 	identity := []string{}
-	if b.Name != "" {
+	if b != nil && b.Name != "" {
 		identity = append(identity,
 			"Your name is \""+b.Name+"\". This is who you are — when a user "+
 				"asks your name (e.g. \"what's your name?\", \"คุณชื่ออะไร\", "+
 				"\"who are you?\"), answer with this name. Do not say you have no name.",
 		)
 	}
-	if hint := personaHint(b.Persona); hint != "" {
-		identity = append(identity, hint)
-	}
-	if hint := languageHint(b.Language); hint != "" {
-		identity = append(identity, hint)
+	if b != nil {
+		if hint := personaHint(b.Persona); hint != "" {
+			identity = append(identity, hint)
+		}
+		if hint := languageHint(b.Language); hint != "" {
+			identity = append(identity, hint)
+		}
 	}
 
-	// Tack on a live business-hours status line so the AI knows whether
-	// the shop is open right now.
+	// Business hours — always injected from the DB so the AI can answer
+	// "เปิดกี่โมง?" without needing a knowledge-base entry.
 	if hint := businessHoursHint(t.BusinessHours); hint != "" {
 		identity = append(identity, hint)
 	}
@@ -337,18 +616,13 @@ func (o *Orchestrator) resolveBotSettings(ctx context.Context, tenantID string) 
 	return settings
 }
 
-// businessHoursHint returns a multi-line directive describing the open/closed
-// status AND telling the AI exactly how to behave during after-hours. We
-// compute this at request time so it always reflects "right now" rather than
-// whenever the schedule was last saved.
+// businessHoursHint returns a multi-line directive that gives the AI:
+//  1. The full weekly schedule — so it can answer "เปิดกี่โมง?" / "วันเสาร์เปิดไหม?" directly.
+//  2. The current open/closed status — so it knows whether to serve normally
+//     or append an after-hours notice.
 //
-// Behavior the prompt encodes:
-//
-//   - OPEN  → carry on as normal.
-//   - CLOSED → still answer the customer's question using the knowledge base,
-//     then append a bilingual closing-time notice. Only fall back to
-//     the saved out-of-hours message when the question genuinely
-//     needs a human (refund, complaint, custom request).
+// This means the AI never needs a knowledge-base entry for business hours;
+// the answer comes straight from the database every request.
 //
 // Returns empty string when the tenant hasn't configured hours yet.
 func businessHoursHint(bh *models.BusinessHours) string {
@@ -362,10 +636,42 @@ func businessHoursHint(bh *models.BusinessHours) string {
 	now := time.Now().In(loc)
 	day := bh.Days[int(now.Weekday())]
 
+	// ── Build the full weekly schedule block ─────────────────────────
+	// Both Thai and English day names so the AI can respond in either language.
+	type dayMeta struct{ en, th string }
+	dayNames := [7]dayMeta{
+		{"Sunday", "วันอาทิตย์"},
+		{"Monday", "วันจันทร์"},
+		{"Tuesday", "วันอังคาร"},
+		{"Wednesday", "วันพุธ"},
+		{"Thursday", "วันพฤหัสบดี"},
+		{"Friday", "วันศุกร์"},
+		{"Saturday", "วันเสาร์"},
+	}
+	scheduleLines := []string{}
+	for i, d := range bh.Days {
+		n := dayNames[i]
+		if d.Enabled {
+			scheduleLines = append(scheduleLines,
+				fmt.Sprintf("  %s / %s: %s – %s", n.en, n.th, d.Open, d.Close),
+			)
+		} else {
+			scheduleLines = append(scheduleLines,
+				fmt.Sprintf("  %s / %s: closed / ปิด", n.en, n.th),
+			)
+		}
+	}
+	scheduleBlock := "Weekly schedule (" + bh.Timezone + "):\n" +
+		strings.Join(scheduleLines, "\n") + "\n" +
+		"Use this schedule to answer ANY question about business hours " +
+		"(e.g. \"เปิดกี่โมง?\", \"วันเสาร์เปิดไหม?\", \"what time do you open?\"). " +
+		"Answer confidently from the schedule above — do NOT say you don't know."
+
 	// ── OPEN right now ───────────────────────────────────────────────
 	currentHM := now.Format("15:04")
 	if day.Enabled && currentHM >= day.Open && currentHM < day.Close {
-		return "Business status: OPEN now (until " + day.Close + " " + bh.Timezone + "). " +
+		return scheduleBlock + "\n\n" +
+			"Current status: OPEN now (until " + day.Close + " " + bh.Timezone + "). " +
 			"Answer the customer normally."
 	}
 
@@ -395,7 +701,8 @@ func businessHoursHint(bh *models.BusinessHours) string {
 	thNotice := "ขณะนี้อยู่นอกเวลาทำการ ทีมงานจะกลับมาให้บริการ " + thBack + " ค่ะ 🙏"
 	enNotice := "We're currently outside business hours. Our team will be back " + enBack + "."
 
-	out := "Business status: CLOSED. Next opening: " + nextLabel + " at " + nextTime + " (" + bh.Timezone + ").\n" +
+	out := scheduleBlock + "\n\n" +
+		"Current status: CLOSED. Next opening: " + nextLabel + " at " + nextTime + " (" + bh.Timezone + ").\n" +
 		"After-hours behavior:\n" +
 		"  1. ALWAYS try to answer the customer's question using the provided knowledge — " +
 		"do NOT refuse just because we're closed.\n" +
@@ -660,11 +967,9 @@ func (o *Orchestrator) checkMonthlyQuota(ctx context.Context, tenant models.Tena
 		"created_at": bson.M{"$gte": startOfMonth},
 	})
 
-	if int(used) <= limit {
-		return false, ""
-	}
-
-	// Limit exceeded — find the next public plan above this one.
+	// ── 80% warning ──────────────────────────────────────────────────────────
+	// Find the next plan name first (needed for both the warning email and the
+	// quota-exceeded message).
 	nextPlanName := ""
 	var next struct {
 		DisplayName string `bson:"display_name"`
@@ -679,6 +984,28 @@ func (o *Orchestrator) checkMonthlyQuota(ctx context.Context, tenant models.Tena
 		options.FindOne().SetSort(bson.D{{Key: "sort_order", Value: 1}}),
 	).Decode(&next); err == nil {
 		nextPlanName = next.DisplayName
+	}
+
+	warningThreshold := int64(float64(limit) * 0.8)
+	currentMonth := now.Format("2006-01")
+	if used >= warningThreshold && int(used) <= limit && tenant.QuotaWarnMonth != currentMonth {
+		// Mark as warned for this month so we don't spam.
+		_, _ = o.mongo.DB.Collection("tenants").UpdateOne(
+			tctx,
+			bson.M{"_id": tenant.ID},
+			bson.M{"$set": bson.M{"quota_warn_month": currentMonth}},
+		)
+		go o.notifyUsers(
+			context.Background(), tenant.ID,
+			[]string{"owner"},
+			"quota_warning",
+			fmt.Sprintf("⚡ %d%% of monthly AI quota used — %s", int(used)*100/limit, tenant.Name),
+			email.QuotaWarningHTML(tenant.Name, int(used), limit, nextPlanName),
+		)
+	}
+
+	if int(used) <= limit {
+		return false, ""
 	}
 
 	return true, buildQuotaMessage(limit, nextPlanName)

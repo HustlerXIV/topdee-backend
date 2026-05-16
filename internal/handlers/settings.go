@@ -1,14 +1,19 @@
 package handlers
 
 import (
+	"fmt"
+	"io"
+	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/gofiber/fiber/v2"
+	"github.com/google/uuid"
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/mongo"
 	"golang.org/x/crypto/bcrypt"
 
+	"github.com/topdee/backend/internal/config"
 	"github.com/topdee/backend/internal/db"
 	"github.com/topdee/backend/internal/middleware"
 	"github.com/topdee/backend/internal/models"
@@ -16,15 +21,21 @@ import (
 
 type SettingsHandler struct {
 	mongo *db.Mongo
+	cfg   *config.Config
 }
 
-func NewSettingsHandler(m *db.Mongo) *SettingsHandler {
-	return &SettingsHandler{mongo: m}
+func NewSettingsHandler(m *db.Mongo, cfg ...*config.Config) *SettingsHandler {
+	h := &SettingsHandler{mongo: m}
+	if len(cfg) > 0 {
+		h.cfg = cfg[0]
+	}
+	return h
 }
 
 type settingsView struct {
-	Account   accountSettingsView   `json:"account"`
-	Workspace workspaceSettingsView `json:"workspace"`
+	Account      accountSettingsView      `json:"account"`
+	Workspace    workspaceSettingsView    `json:"workspace"`
+	Notification notificationSettingsView `json:"notification"`
 }
 
 type accountSettingsView struct {
@@ -33,11 +44,19 @@ type accountSettingsView struct {
 	Role  string `json:"role"`
 }
 
+type notificationSettingsView struct {
+	NewChat      bool `json:"new_chat"`
+	AICantAnswer bool `json:"ai_cant_answer"`
+	QuotaWarning bool `json:"quota_warning"`
+	DailySummary bool `json:"daily_summary"`
+}
+
 type workspaceSettingsView struct {
 	Name         string `json:"name"`
 	Timezone     string `json:"timezone"`
 	Website      string `json:"website"`
 	BusinessType string `json:"business_type"`
+	LogoURL      string `json:"logo_url"`
 }
 
 func (h *SettingsHandler) Get(c *fiber.Ctx) error {
@@ -57,8 +76,9 @@ func (h *SettingsHandler) Get(c *fiber.Ctx) error {
 	}
 
 	return c.JSON(settingsView{
-		Account:   accountView(u),
-		Workspace: workspaceView(t),
+		Account:      accountView(u),
+		Workspace:    workspaceView(t),
+		Notification: notifView(u),
 	})
 }
 
@@ -207,6 +227,63 @@ func accountView(u models.User) accountSettingsView {
 	return accountSettingsView{Name: u.Name, Email: u.Email, Role: u.Role}
 }
 
+// notifView returns the notification preferences for a user.
+// When the user has never saved prefs (nil), all defaults are true.
+func notifView(u models.User) notificationSettingsView {
+	p := models.DefaultNotifPrefs()
+	if u.NotifPrefs != nil {
+		p = *u.NotifPrefs
+	}
+	return notificationSettingsView{
+		NewChat:      p.NewChat,
+		AICantAnswer: p.AICantAnswer,
+		QuotaWarning: p.QuotaWarning,
+		DailySummary: p.DailySummary,
+	}
+}
+
+type updateNotificationsReq struct {
+	NewChat      bool `json:"new_chat"`
+	AICantAnswer bool `json:"ai_cant_answer"`
+	QuotaWarning bool `json:"quota_warning"`
+	DailySummary bool `json:"daily_summary"`
+}
+
+// UpdateNotifications handles PATCH /api/v1/settings/notifications.
+// Saves the caller's personal email notification preferences.
+func (h *SettingsHandler) UpdateNotifications(c *fiber.Ctx) error {
+	uid := middleware.UserID(c)
+	tid := middleware.TenantID(c)
+
+	var req updateNotificationsReq
+	if err := c.BodyParser(&req); err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid body")
+	}
+
+	prefs := models.NotificationPrefs{
+		NewChat:      req.NewChat,
+		AICantAnswer: req.AICantAnswer,
+		QuotaWarning: req.QuotaWarning,
+		DailySummary: req.DailySummary,
+	}
+
+	_, err := h.mongo.DB.Collection("users").UpdateOne(
+		c.Context(),
+		bson.M{"_id": uid, "tenant_id": tid},
+		bson.M{"$set": bson.M{"notif_prefs": prefs}},
+	)
+	if err != nil {
+		return err
+	}
+
+	return c.JSON(notificationSettingsView{
+		NewChat:      prefs.NewChat,
+		AICantAnswer: prefs.AICantAnswer,
+		QuotaWarning: prefs.QuotaWarning,
+		DailySummary: prefs.DailySummary,
+	})
+}
+
 func workspaceView(t models.Tenant) workspaceSettingsView {
 	timezone := t.Timezone
 	if timezone == "" && t.BusinessHours != nil {
@@ -220,5 +297,90 @@ func workspaceView(t models.Tenant) workspaceSettingsView {
 		Timezone:     timezone,
 		Website:      t.Website,
 		BusinessType: t.BusinessType,
+		LogoURL:      t.LogoURL,
 	}
+}
+
+// UploadLogo handles POST /api/v1/settings/workspace/logo
+// Accepts multipart/form-data with a single "logo" file field.
+// Validates type (JPEG/PNG/WebP) and size (max 5 MB), uploads to R2,
+// saves the public URL on the tenant document, and returns it.
+func (h *SettingsHandler) UploadLogo(c *fiber.Ctx) error {
+	if h.cfg == nil || h.cfg.R2AccountID == "" || h.cfg.R2AccessKey == "" {
+		return fiber.NewError(fiber.StatusServiceUnavailable, "logo upload is not configured")
+	}
+
+	tid := middleware.TenantID(c)
+
+	file, err := c.FormFile("logo")
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "missing logo file (field name: logo)")
+	}
+
+	const maxBytes = 5 << 20 // 5 MB
+	if file.Size > maxBytes {
+		return fiber.NewError(fiber.StatusBadRequest, "logo must be ≤ 5 MB")
+	}
+
+	ct := file.Header.Get("Content-Type")
+	ext := ""
+	switch ct {
+	case "image/jpeg":
+		ext = "jpg"
+	case "image/png":
+		ext = "png"
+	case "image/webp":
+		ext = "webp"
+	default:
+		// Fall back to file extension if content-type is unreliable.
+		switch strings.ToLower(filepath.Ext(file.Filename)) {
+		case ".jpg", ".jpeg":
+			ext, ct = "jpg", "image/jpeg"
+		case ".png":
+			ext, ct = "png", "image/png"
+		case ".webp":
+			ext, ct = "webp", "image/webp"
+		default:
+			return fiber.NewError(fiber.StatusBadRequest, "logo must be JPEG, PNG, or WebP")
+		}
+	}
+
+	f, err := file.Open()
+	if err != nil {
+		return fmt.Errorf("open upload: %w", err)
+	}
+	defer f.Close()
+
+	body, err := io.ReadAll(io.LimitReader(f, maxBytes+1))
+	if err != nil {
+		return fmt.Errorf("read upload: %w", err)
+	}
+	if int64(len(body)) > maxBytes {
+		return fiber.NewError(fiber.StatusBadRequest, "logo must be ≤ 5 MB")
+	}
+
+	key := fmt.Sprintf("logos/%s/%s.%s", tid, uuid.New().String(), ext)
+
+	client := &r2Client{
+		accountID: h.cfg.R2AccountID,
+		accessKey: h.cfg.R2AccessKey,
+		secretKey: h.cfg.R2SecretKey,
+		bucket:    h.cfg.R2Bucket,
+		publicURL: h.cfg.R2PublicURL,
+	}
+	logoURL, err := client.PutObject(key, ct, body)
+	if err != nil {
+		return fmt.Errorf("r2 upload: %w", err)
+	}
+
+	_, err = h.mongo.DB.Collection("tenants").UpdateOne(
+		c.Context(),
+		bson.M{"_id": tid},
+		bson.M{"$set": bson.M{"logo_url": logoURL}},
+	)
+	if err != nil {
+		return fmt.Errorf("save logo_url: %w", err)
+	}
+
+	return c.JSON(fiber.Map{"logo_url": logoURL})
 }

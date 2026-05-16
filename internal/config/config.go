@@ -69,6 +69,15 @@ type Config struct {
 	// Example: "Topdee <noreply@mail.yourdomain.com>"
 	EmailFrom string
 
+	// Google OAuth 2.0 — used for "Sign in with Google" on the login page.
+	// Create credentials at https://console.cloud.google.com/ → APIs & Services
+	// → Credentials → OAuth 2.0 Client IDs (Web application).
+	// Add {BACKEND_PUBLIC_URL}/api/v1/auth/google/callback as an authorised
+	// redirect URI in the Google console.
+	GoogleClientID         string
+	GoogleClientSecret     string
+	GoogleOAuthRedirectURI string
+
 	// Stripe — payment processing. Set via env. The webhook secret comes
 	// from the Stripe dashboard's "Reveal" on the endpoint page; keep it
 	// in env, never hard-coded.
@@ -84,6 +93,16 @@ type Config struct {
 	// Use "*" for development, your frontend domain in production.
 	// e.g. "https://topdee.com"
 	AllowOrigins string
+
+	// Cloudflare R2 — S3-compatible object storage for tenant logo uploads.
+	// Create a bucket + API token at dash.cloudflare.com → R2 → Manage R2 API Tokens.
+	// R2PublicURL is your bucket's public domain (enable "Public access" on the bucket
+	// or use a Custom Domain). Example: https://assets.example.com
+	R2AccountID string
+	R2AccessKey string
+	R2SecretKey string
+	R2Bucket    string
+	R2PublicURL string
 }
 
 func Load() (*Config, error) {
@@ -115,11 +134,21 @@ func Load() (*Config, error) {
 		ResendAPIKey: getEnv("RESEND_API_KEY", ""),
 		EmailFrom:    getEnv("EMAIL_FROM", "Topdee <noreply@example.com>"),
 
+		GoogleClientID:         getEnv("GOOGLE_CLIENT_ID", ""),
+		GoogleClientSecret:     getEnv("GOOGLE_CLIENT_SECRET", ""),
+		GoogleOAuthRedirectURI: getEnv("GOOGLE_OAUTH_REDIRECT_URI", "http://localhost:8080/api/v1/auth/google/callback"),
+
 		StripeSecretKey:     getEnv("STRIPE_SECRET_KEY", ""),
 		StripeWebhookSecret: getEnv("STRIPE_WEBHOOK_SECRET", ""),
 		BillingReturnURL:    getEnv("BILLING_RETURN_URL", "http://localhost:3000/billing"),
 
 		AllowOrigins: getEnv("CORS_ALLOW_ORIGINS", "*"),
+
+		R2AccountID: getEnv("R2_ACCOUNT_ID", ""),
+		R2AccessKey: getEnv("R2_ACCESS_KEY", ""),
+		R2SecretKey: getEnv("R2_SECRET_KEY", ""),
+		R2Bucket:    getEnv("R2_BUCKET", ""),
+		R2PublicURL: getEnv("R2_PUBLIC_URL", ""),
 	}
 	ttl, _ := strconv.Atoi(getEnv("JWT_TTL_HOURS", "24"))
 	if ttl <= 0 {

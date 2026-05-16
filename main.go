@@ -46,7 +46,7 @@ func main() {
 
 	hub := realtime.NewHub()
 
-	orch := handlers.NewOrchestrator(mongo, aiClient, cfg)
+	orch := handlers.NewOrchestrator(mongo, aiClient, cfg, hub)
 
 	// Channel provider registry — adding a new social platform is one
 	// `registry.Register(NewFooProvider())` line.
@@ -101,6 +101,11 @@ func main() {
 	api.Post("/auth/register", authH.Register)
 	api.Post("/auth/login", authH.Login)
 
+	// Google OAuth — public, browser-redirect flow.
+	googleH := handlers.NewGoogleAuthHandler(mongo, cfg)
+	api.Get("/auth/google/start", googleH.Start)
+	api.Get("/auth/google/callback", googleH.Callback)
+
 	// Public plans — no auth, used by homepage and billing page.
 	api.Get("/plans", handlers.PublicPlans(mongo))
 
@@ -146,11 +151,13 @@ func main() {
 	protected.Put("/bot", botH.Update)
 
 	// Settings — current user's account, password, and workspace profile.
-	settingsH := handlers.NewSettingsHandler(mongo)
+	settingsH := handlers.NewSettingsHandler(mongo, cfg)
 	protected.Get("/settings", settingsH.Get)
 	protected.Patch("/settings/account", settingsH.UpdateAccount)
 	protected.Patch("/settings/password", settingsH.UpdatePassword)
 	protected.Patch("/settings/workspace", settingsH.UpdateWorkspace)
+	protected.Post("/settings/workspace/logo", settingsH.UploadLogo)
+	protected.Patch("/settings/notifications", settingsH.UpdateNotifications)
 
 	// Team — members + invites. Anyone in the workspace can list members,
 	// but write operations are gated to owner/admin via RequireRole.
@@ -200,6 +207,7 @@ func main() {
 	protected.Get("/inbox/media/:id", inboxH.GetMedia)
 	protected.Get("/inbox/conversations/:id/messages", inboxH.GetMessages)
 	protected.Post("/inbox/conversations/:id/messages", inboxH.SendMessage)
+	protected.Patch("/inbox/conversations/:id/resolve", inboxH.ResolveHandoff)
 
 	// Stripe billing — tenant-scoped self-service.
 	billingH := handlers.NewBillingHandler(mongo, cfg)

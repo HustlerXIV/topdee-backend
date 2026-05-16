@@ -91,6 +91,7 @@ type BusinessHours struct {
 type Tenant struct {
 	ID           string `bson:"_id" json:"id"`
 	Name         string `bson:"name" json:"name"`
+	LogoURL      string `bson:"logo_url,omitempty" json:"logo_url,omitempty"`
 	Timezone     string `bson:"timezone,omitempty" json:"timezone,omitempty"`
 	Website      string `bson:"website,omitempty" json:"website,omitempty"`
 	BusinessType string `bson:"business_type,omitempty" json:"business_type,omitempty"`
@@ -108,7 +109,31 @@ type Tenant struct {
 	BusinessHours        *BusinessHours      `bson:"business_hours,omitempty" json:"business_hours,omitempty"`
 	Facebook             *FacebookConnection `bson:"facebook,omitempty" json:"facebook,omitempty"`
 	Line                 *LineConnection     `bson:"line,omitempty" json:"line,omitempty"`
-	CreatedAt            time.Time           `bson:"created_at" json:"created_at"`
+	// QuotaWarnMonth tracks when we last sent the 80% usage warning, stored as
+	// "YYYY-MM" (e.g. "2026-05"). We skip sending if it matches the current
+	// month so owners only get one email per billing cycle.
+	QuotaWarnMonth string    `bson:"quota_warn_month,omitempty" json:"-"`
+	CreatedAt      time.Time `bson:"created_at" json:"created_at"`
+}
+
+// NotificationPrefs stores which email alerts a user has opted into.
+// Defaults: all true — a brand-new user gets everything until they opt out.
+// Stored as a sub-document on the users collection.
+type NotificationPrefs struct {
+	NewChat      bool `bson:"new_chat" json:"new_chat"`
+	AICantAnswer bool `bson:"ai_cant_answer" json:"ai_cant_answer"`
+	QuotaWarning bool `bson:"quota_warning" json:"quota_warning"`
+	DailySummary bool `bson:"daily_summary" json:"daily_summary"`
+}
+
+// DefaultNotifPrefs returns the "all enabled" state for new users.
+func DefaultNotifPrefs() NotificationPrefs {
+	return NotificationPrefs{
+		NewChat:      true,
+		AICantAnswer: true,
+		QuotaWarning: true,
+		DailySummary: true,
+	}
 }
 
 type User struct {
@@ -118,6 +143,9 @@ type User struct {
 	Email        string `bson:"email" json:"email"`
 	PasswordHash string `bson:"password_hash" json:"-"`
 	Role         string `bson:"role" json:"role"` // "owner" | "admin" | "agent" | "viewer"
+	// NotifPrefs holds per-user email notification opt-in flags.
+	// Missing sub-document means all enabled (default for existing users).
+	NotifPrefs *NotificationPrefs `bson:"notif_prefs,omitempty" json:"notif_prefs,omitempty"`
 	// IsPlatformAdmin separates Topdee staff from tenant users. A platform
 	// admin can manage every workspace via /api/v1/admin/* but is otherwise
 	// still tied to a tenant for normal product use.

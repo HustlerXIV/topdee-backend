@@ -247,6 +247,66 @@ func QuotaWarningHTML(workspaceName string, used, limit int, nextPlan string) st
 	)
 }
 
+// ── Password-reset email template ────────────────────────────────────────────
+
+// ForgotPasswordHTML returns the HTML body for a password-reset request.
+// resetURL is the full URL the user clicks to land on the reset-password page,
+// e.g. "https://www.top-dee.com/reset-password?token=<raw_token>".
+// The link expires in 1 hour — that deadline should be reflected here.
+func ForgotPasswordHTML(userName, resetURL string) string {
+	return fmt.Sprintf(`<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="UTF-8"/><meta name="viewport" content="width=device-width,initial-scale=1.0"/>
+<title>Reset your Topdee password</title></head>
+<body style="margin:0;padding:0;background:#f4f4f5;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;">
+<table width="100%%" cellpadding="0" cellspacing="0" style="background:#f4f4f5;padding:40px 16px;">
+  <tr><td align="center">
+    <table width="100%%" cellpadding="0" cellspacing="0" style="max-width:520px;">
+      <tr><td align="center" style="padding-bottom:24px;">
+        <span style="font-size:22px;font-weight:800;color:#18181b;letter-spacing:-0.5px;">Topdee</span>
+      </td></tr>
+      <tr><td style="background:#ffffff;border-radius:16px;padding:40px 36px;box-shadow:0 1px 3px rgba(0,0,0,0.07);">
+        <p style="margin:0 0 8px;font-size:13px;font-weight:600;color:#71717a;text-transform:uppercase;letter-spacing:0.8px;">Password reset</p>
+        <h1 style="margin:0 0 16px;font-size:24px;font-weight:800;color:#18181b;line-height:1.3;">
+          Reset your password
+        </h1>
+        <p style="margin:0 0 28px;font-size:15px;color:#52525b;line-height:1.6;">
+          Hi <strong>%s</strong>,<br/><br/>
+          We received a request to reset the password for your Topdee account.
+          Click the button below to choose a new password. This link is valid for <strong>1 hour</strong>.
+        </p>
+        <table cellpadding="0" cellspacing="0" style="margin:0 0 28px;">
+          <tr><td style="background:#6366f1;border-radius:10px;">
+            <a href="%s"
+               style="display:inline-block;padding:14px 32px;font-size:15px;font-weight:700;color:#ffffff;text-decoration:none;letter-spacing:0.1px;">
+              Reset password →
+            </a>
+          </td></tr>
+        </table>
+        <p style="margin:0 0 8px;font-size:13px;color:#a1a1aa;">
+          Or copy and paste this link into your browser:
+        </p>
+        <p style="margin:0 0 28px;font-size:12px;color:#6366f1;word-break:break-all;">%s</p>
+        <hr style="border:none;border-top:1px solid #f4f4f5;margin:0 0 20px;"/>
+        <p style="margin:0;font-size:13px;color:#a1a1aa;line-height:1.6;">
+          If you didn't request a password reset, you can safely ignore this email — your password will not change.
+          This link expires in 1 hour.
+        </p>
+      </td></tr>
+      <tr><td align="center" style="padding-top:24px;">
+        <p style="margin:0;font-size:12px;color:#a1a1aa;">© %d Topdee</p>
+      </td></tr>
+    </table>
+  </td></tr>
+</table>
+</body></html>`,
+		userName,
+		resetURL,
+		resetURL,
+		time.Now().Year(),
+	)
+}
+
 // ── Invite email template ─────────────────────────────────────────────────────
 
 // InviteHTML returns the HTML body for a team invite email.

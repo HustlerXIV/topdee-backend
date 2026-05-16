@@ -1,6 +1,10 @@
 package handlers
 
 import (
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
 	"time"
 
 	"github.com/gofiber/fiber/v2"
@@ -12,6 +16,7 @@ import (
 	"github.com/topdee/backend/internal/auth"
 	"github.com/topdee/backend/internal/config"
 	"github.com/topdee/backend/internal/db"
+	"github.com/topdee/backend/internal/email"
 	"github.com/topdee/backend/internal/models"
 )
 
@@ -124,6 +129,118 @@ func (h *AuthHandler) Register(c *fiber.Ctx) error {
 type loginReq struct {
 	Email    string `json:"email"`
 	Password string `json:"password"`
+}
+
+// ── Forgot / Reset password ───────────────────────────────────────────────────
+
+// ForgotPassword accepts an email address, generates a time-limited reset
+// token, stores its SHA-256 hash on the user, and sends a reset link via
+// Resend. Returns 404 when the email is not registered so the user knows
+// they need to sign up first.
+func (h *AuthHandler) ForgotPassword(c *fiber.Ctx) error {
+	var req struct {
+		Email string `json:"email"`
+	}
+	if err := c.BodyParser(&req); err != nil || req.Email == "" {
+		return fiber.NewError(fiber.StatusBadRequest, "email required")
+	}
+
+	// Look up the user — tell them explicitly if not found.
+	var u models.User
+	err := h.mongo.DB.Collection("users").
+		FindOne(c.Context(), bson.M{"email": req.Email}).Decode(&u)
+	if err != nil {
+		return fiber.NewError(fiber.StatusNotFound, "no account found with that email — please register first")
+	}
+
+	// Generate 32 random bytes → hex token (64 chars).
+	raw := make([]byte, 32)
+	if _, err := rand.Read(raw); err != nil {
+		return fmt.Errorf("forgot-password: rand: %w", err)
+	}
+	plainToken := hex.EncodeToString(raw)
+
+	// Hash the token for storage — we never store the plaintext.
+	sum := sha256.Sum256([]byte(plainToken))
+	tokenHash := hex.EncodeToString(sum[:])
+	expiresAt := time.Now().UTC().Add(1 * time.Hour)
+
+	_, err = h.mongo.DB.Collection("users").UpdateOne(
+		c.Context(),
+		bson.M{"_id": u.ID},
+		bson.M{"$set": bson.M{
+			"password_reset_token_hash":  tokenHash,
+			"password_reset_expires_at": expiresAt,
+		}},
+	)
+	if err != nil {
+		return err
+	}
+
+	// Build the reset URL and fire the email in the background.
+	resetURL := h.cfg.FrontendBaseURL + "/reset-password?token=" + plainToken
+	mailer := &email.Mailer{APIKey: h.cfg.ResendAPIKey, From: h.cfg.EmailFrom}
+	go func() {
+		_ = mailer.Send(
+			u.Email,
+			"Reset your Topdee password",
+			email.ForgotPasswordHTML(u.Name, resetURL),
+		)
+	}()
+
+	return c.JSON(fiber.Map{"ok": true})
+}
+
+// ResetPassword validates the reset token and updates the user's password.
+// The token is the raw (unhashed) value from the email link.
+func (h *AuthHandler) ResetPassword(c *fiber.Ctx) error {
+	var req struct {
+		Token    string `json:"token"`
+		Password string `json:"password"`
+	}
+	if err := c.BodyParser(&req); err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid body")
+	}
+	if req.Token == "" || len(req.Password) < 8 {
+		return fiber.NewError(fiber.StatusBadRequest, "token and password (>=8 chars) required")
+	}
+
+	// Hash the incoming token to compare against the stored hash.
+	sum := sha256.Sum256([]byte(req.Token))
+	tokenHash := hex.EncodeToString(sum[:])
+
+	var u models.User
+	err := h.mongo.DB.Collection("users").
+		FindOne(c.Context(), bson.M{"password_reset_token_hash": tokenHash}).Decode(&u)
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid or expired token")
+	}
+
+	// Check expiry.
+	if u.PasswordResetExpiresAt == nil || time.Now().UTC().After(*u.PasswordResetExpiresAt) {
+		return fiber.NewError(fiber.StatusBadRequest, "reset link has expired — please request a new one")
+	}
+
+	// Hash the new password.
+	hash, err := bcrypt.GenerateFromPassword([]byte(req.Password), bcrypt.DefaultCost)
+	if err != nil {
+		return err
+	}
+
+	// Save new password and clear the reset token atomically.
+	_, err = h.mongo.DB.Collection("users").UpdateOne(
+		c.Context(),
+		bson.M{"_id": u.ID},
+		bson.M{
+			"$set":   bson.M{"password_hash": string(hash)},
+			"$unset": bson.M{"password_reset_token_hash": "", "password_reset_expires_at": ""},
+		},
+	)
+	if err != nil {
+		return err
+	}
+
+	return c.JSON(fiber.Map{"ok": true})
 }
 
 func (h *AuthHandler) Login(c *fiber.Ctx) error {

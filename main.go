@@ -100,6 +100,8 @@ func main() {
 	authH := handlers.NewAuthHandler(mongo, cfg)
 	api.Post("/auth/register", authH.Register)
 	api.Post("/auth/login", authH.Login)
+	api.Post("/auth/forgot-password", authH.ForgotPassword)
+	api.Post("/auth/reset-password", authH.ResetPassword)
 
 	// Google OAuth — public, browser-redirect flow.
 	googleH := handlers.NewGoogleAuthHandler(mongo, cfg)

@@ -64,6 +64,7 @@ func (LineProvider) ParseEvents(body []byte) ([]ParsedEvent, error) {
 				UserID string `json:"userId"`
 			} `json:"source"`
 			Message *struct {
+				ID   string `json:"id"`
 				Type string `json:"type"`
 				Text string `json:"text"`
 			} `json:"message"`
@@ -74,19 +75,27 @@ func (LineProvider) ParseEvents(body []byte) ([]ParsedEvent, error) {
 	}
 	out := make([]ParsedEvent, 0, len(p.Events))
 	for _, e := range p.Events {
-		// Only handle plain text messages from a 1:1 user for now. Group/room
-		// events, sticker/image messages, and follow/unfollow are dropped
-		// silently — they'd just confuse the orchestrator.
-		if e.Type != "message" || e.Message == nil || e.Message.Type != "text" {
+		if e.Type != "message" || e.Message == nil {
 			continue
 		}
-		if strings.TrimSpace(e.Message.Text) == "" {
+		text := strings.TrimSpace(e.Message.Text)
+		attachments := []models.Attachment{}
+		if e.Message.Type == "image" && e.Message.ID != "" {
+			attachments = append(attachments, models.Attachment{
+				ID:          e.Message.ID,
+				Type:        "image",
+				URL:         "/api/v1/inbox/media/" + url.PathEscape(e.Message.ID),
+				ContentType: "image/jpeg",
+			})
+		}
+		if text == "" && len(attachments) == 0 {
 			continue
 		}
 		out = append(out, ParsedEvent{
 			ExternalChannelID: p.Destination,
 			ExternalUserID:    e.Source.UserID,
-			Text:              e.Message.Text,
+			Text:              text,
+			Attachments:       attachments,
 			Timestamp:         time.UnixMilli(e.Timestamp),
 			ReplyToken:        e.ReplyToken,
 		})
@@ -221,8 +230,8 @@ func doLinePost(ctx context.Context, url, token string, body []byte) error {
 // users to copy-paste the access token by hand: every Messaging API channel
 // can mint tokens this way without any extra console setup.
 //
-//   POST https://api.line.me/v2/oauth/accessToken
-//   grant_type=client_credentials & client_id=<id> & client_secret=<secret>
+//	POST https://api.line.me/v2/oauth/accessToken
+//	grant_type=client_credentials & client_id=<id> & client_secret=<secret>
 //
 // Returns (token, expires_in_seconds, err). Up to two tokens issued this
 // way can be live at the same time, so refresh-before-expiry is safe.
@@ -267,6 +276,58 @@ func LineIssueAccessToken(ctx context.Context, channelID, channelSecret string) 
 		return "", 0, fmt.Errorf("line oauth: empty access_token in response")
 	}
 	return out.AccessToken, out.ExpiresIn, nil
+}
+
+// LineUserProfile fetches a customer's display name (and picture) so the
+// inbox can show "สมชาย" instead of "LINE User abcd12". Requires that the
+// user has added the bot as a friend AND not blocked profile sharing —
+// returns 404 from LINE otherwise, in which case we fall back to the
+// placeholder. Best-effort, called fire-and-forget on inbound messages.
+//
+//	GET /v2/bot/profile/{userId}
+//
+// Quota: 2,000 calls/sec — far more than we'll ever hit. Persist the
+// result in `customer_profiles` so we don't re-fetch on every poll.
+type LineUserProfileResp struct {
+	UserID        string `json:"userId"`
+	DisplayName   string `json:"displayName"`
+	PictureURL    string `json:"pictureUrl"`
+	StatusMessage string `json:"statusMessage"`
+	Language      string `json:"language"`
+}
+
+func LineUserProfile(ctx context.Context, accessToken, userID string) (*LineUserProfileResp, error) {
+	if accessToken == "" || userID == "" {
+		return nil, fmt.Errorf("line profile: missing token or userId")
+	}
+	req, err := http.NewRequestWithContext(
+		ctx, "GET",
+		"https://api.line.me/v2/bot/profile/"+url.PathEscape(userID),
+		nil,
+	)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		// User isn't a friend / blocked profile sharing. Don't treat as
+		// an error — caller will fall back to the placeholder name.
+		return nil, nil
+	}
+	if resp.StatusCode >= 400 {
+		rb, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("line profile: %s: %s", resp.Status, string(rb))
+	}
+	var out LineUserProfileResp
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, err
+	}
+	return &out, nil
 }
 
 // LineBotInfo asks LINE who-am-I — used to fetch the bot's display name

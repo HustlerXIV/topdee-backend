@@ -5,16 +5,16 @@
 // routing, signature verification, tenant lookup, plan-limit enforcement,
 // connection CRUD — is generic.
 //
-//   ┌────────────┐   POST /webhooks/<name>   ┌───────────────────┐
-//   │  Platform  │ ────────────────────────▶ │ generic webhook   │
-//   │  (LINE,    │                            │   handler         │
-//   │   FB, …)   │                            │                   │
-//   └────────────┘                            │ 1. Provider.Parse │
-//                                             │ 2. lookup conn    │
-//                                             │ 3. Provider.Verify│
-//                                             │ 4. Orchestrator   │
-//                                             │ 5. Provider.Send  │
-//                                             └───────────────────┘
+//	┌────────────┐   POST /webhooks/<name>   ┌───────────────────┐
+//	│  Platform  │ ────────────────────────▶ │ generic webhook   │
+//	│  (LINE,    │                            │   handler         │
+//	│   FB, …)   │                            │                   │
+//	└────────────┘                            │ 1. Provider.Parse │
+//	                                          │ 2. lookup conn    │
+//	                                          │ 3. Provider.Verify│
+//	                                          │ 4. Orchestrator   │
+//	                                          │ 5. Provider.Send  │
+//	                                          └───────────────────┘
 package channels
 
 import (
@@ -39,9 +39,13 @@ type ParsedEvent struct {
 	ExternalChannelID string
 	// ExternalUserID is the sender's id within the platform.
 	ExternalUserID string
-	// Text is the user's message. Non-text events (stickers, images) are
-	// dropped at parse time for now.
+	// Text is the user's message. Media-only events can leave this empty and
+	// carry Attachments instead.
 	Text string
+	// Attachments are media payloads sent with the message. Public providers
+	// can include URL directly; private providers can include an ID for the
+	// backend to proxy later.
+	Attachments []models.Attachment
 	// Timestamp is when the platform reports the message was sent.
 	Timestamp time.Time
 	// ReplyToken — LINE's free reply mechanism. Empty for FB.

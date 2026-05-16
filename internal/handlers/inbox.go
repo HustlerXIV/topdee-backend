@@ -13,7 +13,11 @@ package handlers
 //          persisted as role="human"
 
 import (
+	"context"
+	"io"
 	"log"
+	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -26,16 +30,118 @@ import (
 	"github.com/topdee/backend/internal/db"
 	"github.com/topdee/backend/internal/middleware"
 	"github.com/topdee/backend/internal/models"
+	"github.com/topdee/backend/internal/realtime"
 )
 
 type InboxHandler struct {
 	mongo    *db.Mongo
 	registry *channels.Registry
 	store    *channels.Store
+	hub      *realtime.Hub
 }
 
-func NewInboxHandler(m *db.Mongo, reg *channels.Registry, store *channels.Store) *InboxHandler {
-	return &InboxHandler{mongo: m, registry: reg, store: store}
+func NewInboxHandler(m *db.Mongo, reg *channels.Registry, store *channels.Store, hub *realtime.Hub) *InboxHandler {
+	return &InboxHandler{mongo: m, registry: reg, store: store, hub: hub}
+}
+
+// UnreadCount returns the number of conversations where the customer spoke
+// last (i.e., conversations waiting for a team or AI reply).
+//
+// GET /api/v1/inbox/unread-count → { "count": 7 }
+func (h *InboxHandler) UnreadCount(c *fiber.Ctx) error {
+	tid := middleware.TenantID(c)
+
+	pipeline := []bson.M{
+		{"$match": bson.M{
+			"tenant_id": tid,
+			"channel":   bson.M{"$ne": models.ChannelDashboard},
+		}},
+		{"$sort": bson.M{"created_at": -1}},
+		{"$group": bson.M{
+			"_id":              "$conversation_id",
+			"last_sender_role": bson.M{"$first": "$role"},
+		}},
+		// "user" role = inbound customer message. If the last message is
+		// from the customer, nobody has replied yet → needs attention.
+		{"$match": bson.M{"last_sender_role": models.RoleUser}},
+		{"$count": "count"},
+	}
+
+	cur, err := h.mongo.DB.Collection("messages").Aggregate(c.Context(), pipeline)
+	if err != nil {
+		return err
+	}
+	defer cur.Close(c.Context())
+
+	var result []struct {
+		Count int `bson:"count"`
+	}
+	_ = cur.All(c.Context(), &result)
+
+	count := 0
+	if len(result) > 0 {
+		count = result[0].Count
+	}
+	return c.JSON(fiber.Map{"count": count})
+}
+
+// broadcastUnread recomputes the unread count for a tenant and pushes an
+// inbox_update event to all connected dashboard tabs. Fire-and-forget.
+func (h *InboxHandler) broadcastUnread(tenantID string) {
+	if h.hub == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	pipeline := []bson.M{
+		{"$match": bson.M{
+			"tenant_id": tenantID,
+			"channel":   bson.M{"$ne": models.ChannelDashboard},
+		}},
+		{"$sort": bson.M{"created_at": -1}},
+		{"$group": bson.M{
+			"_id":              "$conversation_id",
+			"last_sender_role": bson.M{"$first": "$role"},
+		}},
+		{"$match": bson.M{"last_sender_role": models.RoleUser}},
+		{"$count": "count"},
+	}
+
+	cur, err := h.mongo.DB.Collection("messages").Aggregate(ctx, pipeline)
+	if err != nil {
+		return
+	}
+	defer cur.Close(ctx)
+
+	var result []struct {
+		Count int `bson:"count"`
+	}
+	_ = cur.All(ctx, &result)
+
+	count := 0
+	if len(result) > 0 {
+		count = result[0].Count
+	}
+	h.hub.Broadcast(tenantID, map[string]any{
+		"type":  "inbox_update",
+		"count": count,
+	})
+}
+
+// resolveCustomerName uses the cached profile when available, otherwise
+// falls back to the placeholder ("LINE User abcd12"). One Mongo round-trip
+// per conversation — cheap given the inbox cap of 200 rows.
+func (h *InboxHandler) resolveCustomerName(ctx context.Context, channel, externalUserID string) string {
+	if externalUserID == "" {
+		return "Unknown"
+	}
+	if h.store != nil {
+		if p, _ := h.store.GetProfile(ctx, channel, externalUserID); p != nil && p.DisplayName != "" {
+			return p.DisplayName
+		}
+	}
+	return customerNameFor(channel, externalUserID)
 }
 
 // inboxConversationView — one row in the inbox list. Computed from the
@@ -127,7 +233,7 @@ func (h *InboxHandler) ListConversations(c *fiber.Ctx) error {
 			ID:             r.ID,
 			Channel:        r.Channel,
 			ExternalUserID: uid,
-			CustomerName:   customerNameFor(r.Channel, uid),
+			CustomerName:   h.resolveCustomerName(c.Context(), r.Channel, uid),
 			Preview:        truncatePreview(r.Preview, 80),
 			LastMessageAt:  r.LastMessageAt,
 			LastSenderRole: r.LastSenderRole,
@@ -141,7 +247,7 @@ func (h *InboxHandler) ListConversations(c *fiber.Ctx) error {
 // to a sensible cap so the dashboard isn't overwhelmed by long histories.
 func (h *InboxHandler) GetMessages(c *fiber.Ctx) error {
 	tid := middleware.TenantID(c)
-	convID := c.Params("id")
+	convID := conversationIDParam(c)
 	if convID == "" {
 		return fiber.NewError(fiber.StatusBadRequest, "missing conversation id")
 	}
@@ -192,7 +298,7 @@ type sendMessageReq struct {
 func (h *InboxHandler) SendMessage(c *fiber.Ctx) error {
 	tid := middleware.TenantID(c)
 	uid := middleware.UserID(c)
-	convID := c.Params("id")
+	convID := conversationIDParam(c)
 	if convID == "" {
 		return fiber.NewError(fiber.StatusBadRequest, "missing conversation id")
 	}
@@ -265,10 +371,99 @@ func (h *InboxHandler) SendMessage(c *fiber.Ctx) error {
 	if _, err := h.mongo.DB.Collection("messages").InsertOne(c.Context(), msg); err != nil {
 		return err
 	}
+
+	// Broadcast updated unread count — agent reply marks conversation as
+	// handled so the badge should drop.
+	go h.broadcastUnread(tid)
+
 	return c.JSON(msg)
 }
 
+// GetMedia proxies private provider media (currently LINE message content)
+// so the authenticated dashboard can display images in the inbox.
+func (h *InboxHandler) GetMedia(c *fiber.Ctx) error {
+	tid := middleware.TenantID(c)
+	mediaID := c.Params("id")
+	if decoded, err := url.PathUnescape(mediaID); err == nil {
+		mediaID = decoded
+	}
+	if mediaID == "" {
+		return fiber.NewError(fiber.StatusBadRequest, "missing media id")
+	}
+
+	var msg models.Message
+	if err := h.mongo.DB.Collection("messages").FindOne(
+		c.Context(),
+		bson.M{"tenant_id": tid, "attachments.id": mediaID},
+	).Decode(&msg); err != nil {
+		return fiber.NewError(fiber.StatusNotFound, "media not found")
+	}
+
+	providerName, externalChannelID, _, ok := parseConversationID(msg.ConversationID)
+	if !ok || providerName != models.ProviderLine {
+		return fiber.NewError(fiber.StatusBadRequest, "unsupported media provider")
+	}
+
+	conn, err := h.store.FindByExternal(c.Context(), providerName, externalChannelID)
+	if err != nil {
+		return err
+	}
+	if conn == nil || conn.TenantID != tid {
+		return fiber.NewError(fiber.StatusNotFound, "channel connection not found")
+	}
+	if provider, ok := h.registry.Get(providerName); ok {
+		if r, ok := provider.(channels.CredentialRefresher); ok {
+			if refreshed, err := r.EnsureCredentials(c.Context(), conn); err != nil {
+				return fiber.NewError(fiber.StatusBadGateway, "could not refresh credentials: "+err.Error())
+			} else if refreshed {
+				if err := h.store.UpdateCredentials(c.Context(), conn.ID, conn.Credentials); err != nil {
+					log.Printf("inbox media: persist refreshed credentials: %v", err)
+				}
+			}
+		}
+	}
+
+	token := conn.Credentials["channel_access_token"]
+	if token == "" {
+		return fiber.NewError(fiber.StatusBadGateway, "line media: no access token")
+	}
+	req, err := http.NewRequestWithContext(
+		c.Context(),
+		http.MethodGet,
+		"https://api-data.line.me/v2/bot/message/"+url.PathEscape(mediaID)+"/content",
+		nil,
+	)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode >= 400 {
+		return fiber.NewError(fiber.StatusBadGateway, "line media fetch failed: "+string(body))
+	}
+	contentType := resp.Header.Get("Content-Type")
+	if contentType == "" {
+		contentType = "image/jpeg"
+	}
+	c.Set("Content-Type", contentType)
+	c.Set("Cache-Control", "private, max-age=300")
+	return c.Send(body)
+}
+
 // ── Helpers ────────────────────────────────────────────────────────────
+
+func conversationIDParam(c *fiber.Ctx) string {
+	id := c.Params("id")
+	if decoded, err := url.PathUnescape(id); err == nil {
+		return decoded
+	}
+	return id
+}
 
 // parseConversationID splits "<provider>:<channel_id>:<user_id>" — the
 // canonical conversation address used by the webhook router. Returns
@@ -310,4 +505,3 @@ func truncatePreview(s string, max int) string {
 	}
 	return string(r[:max]) + "…"
 }
-

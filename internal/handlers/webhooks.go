@@ -25,17 +25,20 @@ import (
 
 	"github.com/gofiber/fiber/v2"
 
+	"go.mongodb.org/mongo-driver/bson"
+
 	"github.com/topdee/backend/internal/channels"
 	"github.com/topdee/backend/internal/config"
 	"github.com/topdee/backend/internal/db"
 	"github.com/topdee/backend/internal/models"
+	"github.com/topdee/backend/internal/realtime"
 )
 
 // WebhookHandler returns the generic GET/POST handler for /webhooks/:provider.
 //
 // Both verbs share the same Fiber handler — we dispatch on c.Method() so the
 // router only needs one entry per provider.
-func WebhookHandler(reg *channels.Registry, store *channels.Store, m *db.Mongo, o *Orchestrator, cfg *config.Config) fiber.Handler {
+func WebhookHandler(reg *channels.Registry, store *channels.Store, m *db.Mongo, o *Orchestrator, cfg *config.Config, hub *realtime.Hub) fiber.Handler {
 	return func(c *fiber.Ctx) error {
 		name := strings.ToLower(c.Params("provider"))
 		p, ok := reg.Get(name)
@@ -79,7 +82,7 @@ func WebhookHandler(reg *channels.Registry, store *channels.Store, m *db.Mongo, 
 
 		// Process asynchronously so we always 200 fast — most platforms
 		// time out the webhook after a few seconds.
-		go processEvents(p, store, m, o, cfg, headers, body, events)
+		go processEvents(p, store, m, o, cfg, hub, headers, body, events)
 		return c.SendStatus(fiber.StatusOK)
 	}
 }
@@ -93,6 +96,7 @@ func processEvents(
 	m *db.Mongo,
 	o *Orchestrator,
 	cfg *config.Config,
+	hub *realtime.Hub,
 	headers map[string]string,
 	body []byte,
 	events []channels.ParsedEvent,
@@ -152,12 +156,22 @@ func processEvents(
 			conversationID := fmt.Sprintf("%s:%s:%s", p.Name(), externalID, evt.ExternalUserID)
 			reply, _, _, err := o.HandleIncoming(
 				ctx, conn.TenantID, conversationID,
-				channelTag, evt.ExternalUserID, evt.Text,
+				channelTag, evt.ExternalUserID, evt.Text, evt.Attachments,
 			)
 			if err != nil {
 				log.Printf("webhook %s: orchestrator: %v", p.Name(), err)
 				continue
 			}
+
+			// Backfill the customer's display name. Fire-and-forget — the
+			// inbox can render with the placeholder if the profile API is
+			// slow or returns 404 (user hasn't friended the bot, etc.).
+			go cacheCustomerProfile(p, store, conn, evt)
+
+			// Notify connected dashboard tabs that a new customer message
+			// arrived so the inbox badge updates in real-time.
+			go broadcastInboxUpdate(hub, m, conn.TenantID)
+
 			if strings.TrimSpace(reply) == "" {
 				continue
 			}
@@ -168,6 +182,50 @@ func processEvents(
 		}
 		cancel()
 	}
+}
+
+// broadcastInboxUpdate recomputes the unread count for a tenant and pushes
+// an inbox_update event to all connected dashboard tabs via the Hub.
+func broadcastInboxUpdate(hub *realtime.Hub, m *db.Mongo, tenantID string) {
+	if hub == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	pipeline := []bson.M{
+		{"$match": bson.M{
+			"tenant_id": tenantID,
+			"channel":   bson.M{"$ne": models.ChannelDashboard},
+		}},
+		{"$sort": bson.M{"created_at": -1}},
+		{"$group": bson.M{
+			"_id":              "$conversation_id",
+			"last_sender_role": bson.M{"$first": "$role"},
+		}},
+		{"$match": bson.M{"last_sender_role": models.RoleUser}},
+		{"$count": "count"},
+	}
+
+	cur, err := m.DB.Collection("messages").Aggregate(ctx, pipeline)
+	if err != nil {
+		return
+	}
+	defer cur.Close(ctx)
+
+	var result []struct {
+		Count int `bson:"count"`
+	}
+	_ = cur.All(ctx, &result)
+
+	count := 0
+	if len(result) > 0 {
+		count = result[0].Count
+	}
+	hub.Broadcast(tenantID, map[string]any{
+		"type":  "inbox_update",
+		"count": count,
+	})
 }
 
 // ── Facebook OAuth callback ────────────────────────────────────────────
@@ -240,4 +298,81 @@ func firstNonEmpty(a, b string) string {
 		return a
 	}
 	return b
+}
+
+// cacheCustomerProfile fetches a customer's display name from the platform
+// (LINE only for now — Meta tightly restricts profile access on Messenger
+// and most page-scoped IDs return nothing useful) and caches it. Idempotent;
+// safe to call on every inbound message — the caller decides how often.
+//
+// Best-effort: any error is logged and swallowed. The inbox falls back to
+// "LINE User abcd12" when no profile is cached.
+func cacheCustomerProfile(p channels.Provider, store *channels.Store, conn *models.ChannelConnection, evt channels.ParsedEvent) {
+	if evt.ExternalUserID == "" {
+		return
+	}
+
+	provider := p.Name()
+	if provider != models.ProviderLine && provider != models.ProviderFacebook {
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	// Skip the network round-trip if we already have a fresh profile.
+	if existing, _ := store.GetProfile(ctx, provider, evt.ExternalUserID); existing != nil {
+		if time.Since(existing.UpdatedAt) < 7*24*time.Hour {
+			return
+		}
+	}
+
+	var displayName, pictureURL, language string
+
+	switch provider {
+	case models.ProviderLine:
+		token := conn.Credentials["channel_access_token"]
+		if token == "" {
+			return
+		}
+		resp, err := channels.LineUserProfile(ctx, token, evt.ExternalUserID)
+		if err != nil {
+			log.Printf("inbox: LINE profile fetch: %v", err)
+			return
+		}
+		if resp == nil || resp.DisplayName == "" {
+			return
+		}
+		displayName = resp.DisplayName
+		pictureURL = resp.PictureURL
+		language = resp.Language
+
+	case models.ProviderFacebook:
+		token := conn.Credentials["page_access_token"]
+		if token == "" {
+			return
+		}
+		resp, err := channels.FacebookUserProfile(ctx, token, evt.ExternalUserID)
+		if err != nil {
+			log.Printf("inbox: Facebook profile fetch: %v", err)
+			return
+		}
+		if resp == nil || resp.DisplayName == "" {
+			// Meta restricts profile access in many cases — fail silently.
+			return
+		}
+		displayName = resp.DisplayName
+		pictureURL = resp.PictureURL
+	}
+
+	if displayName == "" {
+		return
+	}
+	_ = store.UpsertProfile(ctx, &models.CustomerProfile{
+		Provider:       provider,
+		ExternalUserID: evt.ExternalUserID,
+		DisplayName:    displayName,
+		PictureURL:     pictureURL,
+		Language:       language,
+	})
 }

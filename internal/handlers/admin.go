@@ -5,21 +5,28 @@ package handlers
 //
 // Routes (all under /api/v1/admin, all gated by middleware.RequireAdmin):
 //
-//   GET    /metrics                  — high-level counts
-//   GET    /tenants                  — list, optional ?q= search
-//   GET    /tenants/:id              — full record + member count
-//   PATCH  /tenants/:id              — { plan?, suspended? }
-//   DELETE /tenants/:id              — cascade-deletes users + KBs + messages
-//   GET    /users                    — list, ?tenant_id=, ?q=, ?suspended=
-//   PATCH  /users/:id                — { role?, suspended?, is_platform_admin? }
-//   DELETE /users/:id                — removes a single user (must not be last owner)
+//   GET    /metrics                       — high-level counts
+//   GET    /tenants                       — list, optional ?q= search
+//   GET    /tenants/:id                   — full record + member count
+//   PATCH  /tenants/:id                   — { plan?, suspended? }
+//   DELETE /tenants/:id                   — cascade-deletes users + KBs + messages
+//   GET    /users                         — list, ?tenant_id=, ?q=, ?suspended=
+//   PATCH  /users/:id                     — { role?, suspended?, is_platform_admin? }
+//   DELETE /users/:id                     — removes a single user (must not be last owner)
+//   GET    /plans                         — list all plans
+//   POST   /plans                         — create a plan
+//   GET    /plans/:id                     — get one plan
+//   PUT    /plans/:id                     — full update
+//   DELETE /plans/:id                     — delete (blocked if tenants use it)
 //
 // All write operations are idempotent enough to be safely retried.
 
 import (
+	"context"
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/gofiber/fiber/v2"
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/mongo/options"
@@ -531,4 +538,273 @@ func (h *AdminHandler) DeleteUser(c *fiber.Ctx) error {
 		return err
 	}
 	return c.SendStatus(fiber.StatusNoContent)
+}
+
+// ── Plans ──────────────────────────────────────────────────────────────
+
+// PublicPlans is a no-auth handler for GET /api/v1/plans.
+// Returns only active, public plans, sorted by sort_order.
+// Plans with is_public=false are hidden/custom plans only visible to admins.
+func PublicPlans(m *db.Mongo) fiber.Handler {
+	return func(c *fiber.Ctx) error {
+		cur, err := m.DB.Collection("plans").Find(
+			c.Context(),
+			bson.M{"is_active": true, "is_public": true},
+			options.Find().SetSort(bson.D{{Key: "sort_order", Value: 1}}),
+		)
+		if err != nil {
+			return err
+		}
+		var plans []models.Plan
+		if err := cur.All(c.Context(), &plans); err != nil {
+			return err
+		}
+		if plans == nil {
+			plans = []models.Plan{}
+		}
+		return c.JSON(plans)
+	}
+}
+
+// GET /api/v1/admin/plans
+func (h *AdminHandler) ListPlans(c *fiber.Ctx) error {
+	cur, err := h.mongo.DB.Collection("plans").Find(
+		c.Context(), bson.M{},
+		options.Find().SetSort(bson.D{{Key: "sort_order", Value: 1}}),
+	)
+	if err != nil {
+		return err
+	}
+	var plans []models.Plan
+	if err := cur.All(c.Context(), &plans); err != nil {
+		return err
+	}
+	if plans == nil {
+		plans = []models.Plan{}
+	}
+	return c.JSON(plans)
+}
+
+// GET /api/v1/admin/plans/:id
+func (h *AdminHandler) GetPlan(c *fiber.Ctx) error {
+	id := c.Params("id")
+	var plan models.Plan
+	if err := h.mongo.DB.Collection("plans").
+		FindOne(c.Context(), bson.M{"_id": id}).Decode(&plan); err != nil {
+		return fiber.NewError(fiber.StatusNotFound, "plan not found")
+	}
+	return c.JSON(plan)
+}
+
+type planReq struct {
+	ID            string            `json:"id"`
+	DisplayName   string            `json:"display_name"`
+	Description   string            `json:"description"`
+	Price         float64           `json:"price"`
+	Currency      string            `json:"currency"`
+	IsActive      bool              `json:"is_active"`
+	IsPublic      bool              `json:"is_public"`
+	IsRecommended bool              `json:"is_recommended"`
+	SortOrder     int               `json:"sort_order"`
+	ExpiryDays    int               `json:"expiry_days"`
+	// Stripe price IDs — managed in Admin → Plans UI, not env vars.
+	StripePriceID       string  `json:"stripe_price_id"`
+	StripePriceIDYearly string  `json:"stripe_price_id_yearly"`
+	// Yearly display pricing — what to show on the billing page.
+	YearlyPrice       float64 `json:"yearly_price"`
+	YearlySavingLabel string  `json:"yearly_saving_label"`
+	Limits        models.PlanLimits `json:"limits"`
+}
+
+// POST /api/v1/admin/plans
+func (h *AdminHandler) CreatePlan(c *fiber.Ctx) error {
+	var req planReq
+	if err := c.BodyParser(&req); err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid body")
+	}
+	if req.ID == "" {
+		req.ID = uuid.NewString()
+	}
+	if req.DisplayName == "" {
+		return fiber.NewError(fiber.StatusBadRequest, "display_name is required")
+	}
+	if req.Currency == "" {
+		req.Currency = "THB"
+	}
+	if req.Limits.Channels == nil {
+		req.Limits.Channels = map[string]int{}
+	}
+
+	now := time.Now().UTC()
+	plan := models.Plan{
+		ID:                  strings.ToLower(strings.TrimSpace(req.ID)),
+		DisplayName:         req.DisplayName,
+		Description:         req.Description,
+		Price:               req.Price,
+		Currency:            req.Currency,
+		IsActive:            req.IsActive,
+		IsPublic:            req.IsPublic,
+		IsRecommended:       req.IsRecommended,
+		SortOrder:           req.SortOrder,
+		ExpiryDays:          req.ExpiryDays,
+		StripePriceID:       strings.TrimSpace(req.StripePriceID),
+		StripePriceIDYearly: strings.TrimSpace(req.StripePriceIDYearly),
+		YearlyPrice:         req.YearlyPrice,
+		YearlySavingLabel:   strings.TrimSpace(req.YearlySavingLabel),
+		Limits:              req.Limits,
+		CreatedAt:           now,
+		UpdatedAt:           now,
+	}
+	if _, err := h.mongo.DB.Collection("plans").InsertOne(c.Context(), plan); err != nil {
+		return fiber.NewError(fiber.StatusConflict, "plan id already exists")
+	}
+	return c.Status(fiber.StatusCreated).JSON(plan)
+}
+
+// PUT /api/v1/admin/plans/:id
+func (h *AdminHandler) UpdatePlan(c *fiber.Ctx) error {
+	id := c.Params("id")
+	var req planReq
+	if err := c.BodyParser(&req); err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid body")
+	}
+	if req.DisplayName == "" {
+		return fiber.NewError(fiber.StatusBadRequest, "display_name is required")
+	}
+	if req.Currency == "" {
+		req.Currency = "THB"
+	}
+	if req.Limits.Channels == nil {
+		req.Limits.Channels = map[string]int{}
+	}
+
+	set := bson.M{
+		"display_name":          req.DisplayName,
+		"description":           req.Description,
+		"price":                 req.Price,
+		"currency":              req.Currency,
+		"is_active":             req.IsActive,
+		"is_public":             req.IsPublic,
+		"is_recommended":        req.IsRecommended,
+		"sort_order":            req.SortOrder,
+		"expiry_days":           req.ExpiryDays,
+		"stripe_price_id":       strings.TrimSpace(req.StripePriceID),
+		"stripe_price_id_yearly": strings.TrimSpace(req.StripePriceIDYearly),
+		"yearly_price":          req.YearlyPrice,
+		"yearly_saving_label":   strings.TrimSpace(req.YearlySavingLabel),
+		"limits":                req.Limits,
+		"updated_at":            time.Now().UTC(),
+	}
+	res, err := h.mongo.DB.Collection("plans").UpdateOne(
+		c.Context(), bson.M{"_id": id}, bson.M{"$set": set},
+	)
+	if err != nil {
+		return err
+	}
+	if res.MatchedCount == 0 {
+		return fiber.NewError(fiber.StatusNotFound, "plan not found")
+	}
+	return h.GetPlan(c)
+}
+
+// DELETE /api/v1/admin/plans/:id
+// Blocked if any tenant is currently on this plan.
+func (h *AdminHandler) DeletePlan(c *fiber.Ctx) error {
+	id := c.Params("id")
+	count, _ := h.mongo.DB.Collection("tenants").CountDocuments(
+		c.Context(), bson.M{"plan": id},
+	)
+	if count > 0 {
+		return fiber.NewError(fiber.StatusConflict,
+			"cannot delete: "+string(rune('0'+count))+" tenant(s) are on this plan")
+	}
+	res, err := h.mongo.DB.Collection("plans").DeleteOne(c.Context(), bson.M{"_id": id})
+	if err != nil {
+		return err
+	}
+	if res.DeletedCount == 0 {
+		return fiber.NewError(fiber.StatusNotFound, "plan not found")
+	}
+	return c.SendStatus(fiber.StatusNoContent)
+}
+
+// SeedDefaultPlans inserts the built-in plan tiers if the plans collection
+// is empty. Safe to call on every startup — it's a no-op when plans exist.
+func SeedDefaultPlans(mongo *db.Mongo) error {
+	ctx := context.Background()
+	count, _ := mongo.DB.Collection("plans").CountDocuments(ctx, bson.M{})
+	if count > 0 {
+		return nil
+	}
+
+	now := time.Now().UTC()
+	defaults := []models.Plan{
+		{
+			ID: "free", DisplayName: "Free", Description: "Try Topdee at no cost",
+			Price: 0, Currency: "THB", IsActive: true, IsPublic: true, SortOrder: 0, ExpiryDays: 14,
+			Limits: models.PlanLimits{
+				Channels:         map[string]int{"facebook": 1, "line": 1},
+				Members:          2,
+				MessagesPerMonth: 200,
+				KnowledgeBases:   1,
+				StorageMB:        50,
+			},
+			CreatedAt: now, UpdatedAt: now,
+		},
+		{
+			ID: "starter", DisplayName: "Starter", Description: "For small businesses getting started",
+			Price: 590, Currency: "THB", IsActive: true, IsPublic: true, SortOrder: 1,
+			Limits: models.PlanLimits{
+				Channels:         map[string]int{"facebook": 1, "line": 1},
+				Members:          5,
+				MessagesPerMonth: 1000,
+				KnowledgeBases:   3,
+				StorageMB:        500,
+			},
+			CreatedAt: now, UpdatedAt: now,
+		},
+		{
+			ID: "growth", DisplayName: "Growth", Description: "For growing teams with more volume",
+			Price: 1490, Currency: "THB", IsActive: true, IsPublic: true, IsRecommended: true, SortOrder: 2,
+			Limits: models.PlanLimits{
+				Channels:         map[string]int{"facebook": 5, "line": 3},
+				Members:          15,
+				MessagesPerMonth: 5000,
+				KnowledgeBases:   10,
+				StorageMB:        2000,
+			},
+			CreatedAt: now, UpdatedAt: now,
+		},
+		{
+			ID: "pro", DisplayName: "Pro", Description: "For high-volume businesses",
+			Price: 2990, Currency: "THB", IsActive: true, IsPublic: true, SortOrder: 3,
+			Limits: models.PlanLimits{
+				Channels:         map[string]int{"facebook": 10, "line": 5},
+				Members:          50,
+				MessagesPerMonth: 20000,
+				KnowledgeBases:   -1,
+				StorageMB:        10000,
+			},
+			CreatedAt: now, UpdatedAt: now,
+		},
+		{
+			ID: "enterprise", DisplayName: "Enterprise", Description: "Unlimited scale, dedicated support",
+			Price: 0, Currency: "THB", IsActive: false, IsPublic: true, SortOrder: 4,
+			Limits: models.PlanLimits{
+				Channels:         map[string]int{"facebook": -1, "line": -1},
+				Members:          -1,
+				MessagesPerMonth: -1,
+				KnowledgeBases:   -1,
+				StorageMB:        -1,
+			},
+			CreatedAt: now, UpdatedAt: now,
+		},
+	}
+
+	docs := make([]interface{}, len(defaults))
+	for i, p := range defaults {
+		docs[i] = p
+	}
+	_, err := mongo.DB.Collection("plans").InsertMany(ctx, docs)
+	return err
 }

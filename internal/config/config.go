@@ -59,15 +59,31 @@ type Config struct {
 	// via the admin UI.
 	BootstrapAdminEmails []string
 
+	// Resend — transactional email (https://resend.com).
+	// Sign up, verify your domain, then paste the API key here.
+	// If empty, invite emails are skipped and the accept_url is returned in the
+	// API response so you can share it manually during development.
+	ResendAPIKey string
+	// EmailFrom is the "From" address for outbound emails.
+	// Must match a domain verified in your Resend account.
+	// Example: "Topdee <noreply@mail.yourdomain.com>"
+	EmailFrom string
+
 	// Stripe — payment processing. Set via env. The webhook secret comes
 	// from the Stripe dashboard's "Reveal" on the endpoint page; keep it
 	// in env, never hard-coded.
+	//
+	// Per-plan Stripe price IDs (price_xxx) are stored on each Plan document
+	// in MongoDB and managed via Admin → Plans, so they no longer need to be
+	// env vars.
 	StripeSecretKey     string
 	StripeWebhookSecret string
-	// Map of plan name → Stripe price id. Lets us add/rename plans
-	// without touching code, and lets dev/staging/prod use different prices.
-	StripePrices       map[string]string // {"starter": "price_...", "growth": "price_...", "pro": "price_..."}
-	BillingReturnURL   string            // where Checkout + Portal redirect back to
+	BillingReturnURL    string // where Checkout + Portal redirect back to
+
+	// CORS_ALLOW_ORIGINS — comma-separated list of allowed origins.
+	// Use "*" for development, your frontend domain in production.
+	// e.g. "https://topdee.com"
+	AllowOrigins string
 }
 
 func Load() (*Config, error) {
@@ -96,15 +112,14 @@ func Load() (*Config, error) {
 
 		BootstrapAdminEmails: parseEmailList(getEnv("BOOTSTRAP_ADMIN_EMAILS", "")),
 
+		ResendAPIKey: getEnv("RESEND_API_KEY", ""),
+		EmailFrom:    getEnv("EMAIL_FROM", "Topdee <noreply@example.com>"),
+
 		StripeSecretKey:     getEnv("STRIPE_SECRET_KEY", ""),
 		StripeWebhookSecret: getEnv("STRIPE_WEBHOOK_SECRET", ""),
-		StripePrices: map[string]string{
-			"starter":    getEnv("STRIPE_PRICE_STARTER", ""),
-			"growth":     getEnv("STRIPE_PRICE_GROWTH", ""),
-			"pro":        getEnv("STRIPE_PRICE_PRO", ""),
-			"enterprise": getEnv("STRIPE_PRICE_ENTERPRISE", ""),
-		},
-		BillingReturnURL: getEnv("BILLING_RETURN_URL", "http://localhost:3000/billing"),
+		BillingReturnURL:    getEnv("BILLING_RETURN_URL", "http://localhost:3000/billing"),
+
+		AllowOrigins: getEnv("CORS_ALLOW_ORIGINS", "*"),
 	}
 	ttl, _ := strconv.Atoi(getEnv("JWT_TTL_HOURS", "24"))
 	if ttl <= 0 {

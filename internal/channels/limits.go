@@ -1,34 +1,73 @@
 package channels
 
-// Plan-based caps on how many connections of each provider a tenant may
-// create. Defined as a static map so changing limits is a one-line edit;
-// long-term this should move to env or a `plans` collection.
-//
-// The "default" entry is the fallback when a tenant's `plan` field doesn't
-// match any known plan name (treat as the most conservative tier).
+import (
+	"context"
+	"time"
 
+	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/mongo"
+)
+
+// PlanLimit is kept for backward-compat with callers that use LimitsForPlan.
 type PlanLimit struct {
 	Facebook int
 	Line     int
 }
 
-var planLimits = map[string]PlanLimit{
-	"free":       {Facebook: 1, Line: 1},
-	"starter":    {Facebook: 1, Line: 1},
-	"basic":      {Facebook: 3, Line: 1},
-	"growth":     {Facebook: 5, Line: 3},
-	"pro":        {Facebook: 10, Line: 5},
-	"enterprise": {Facebook: 100, Line: 100},
-	"default":    {Facebook: 1, Line: 1},
+// planDoc is a minimal projection of the plans collection used by LimitForCtx.
+type planDoc struct {
+	Limits struct {
+		Channels         map[string]int `bson:"channels"`
+		Members          int            `bson:"members"`
+		MessagesPerMonth int            `bson:"messages_per_month"`
+		KnowledgeBases   int            `bson:"knowledge_bases"`
+		StorageMB        int            `bson:"storage_mb"`
+	} `bson:"limits"`
 }
 
-// LimitFor returns how many `provider` connections plan `plan` allows.
-// Unknown plans fall back to the default tier; unknown providers return 0
-// (effectively forbidding the connection).
+// LimitForCtx returns how many `provider` connections `plan` allows by
+// reading the plans collection from MongoDB. Falls back to hardcoded defaults
+// when the collection is unavailable or the plan doesn't exist.
+func LimitForCtx(ctx context.Context, db *mongo.Database, plan, provider string) int {
+	if db != nil {
+		tctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+		defer cancel()
+		var doc planDoc
+		if err := db.Collection("plans").FindOne(tctx, bson.M{"_id": plan}).Decode(&doc); err == nil {
+			if v, ok := doc.Limits.Channels[provider]; ok {
+				return v
+			}
+			// Provider key missing in plan → not offered on this plan.
+			return 0
+		}
+	}
+	// Fallback to hardcoded defaults (legacy / bootstrap).
+	return limitFallback(plan, provider)
+}
+
+// MemberLimitForCtx returns the max team members allowed for a plan.
+func MemberLimitForCtx(ctx context.Context, db *mongo.Database, plan string) int {
+	if db != nil {
+		tctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+		defer cancel()
+		var doc planDoc
+		if err := db.Collection("plans").FindOne(tctx, bson.M{"_id": plan}).Decode(&doc); err == nil {
+			return doc.Limits.Members
+		}
+	}
+	return 5 // hardcoded fallback
+}
+
+// LimitFor is the original signature kept for callers without a DB reference.
+// Uses hardcoded defaults only.
 func LimitFor(plan, provider string) int {
-	pl, ok := planLimits[plan]
+	return limitFallback(plan, provider)
+}
+
+func limitFallback(plan, provider string) int {
+	pl, ok := hardcodedLimits[plan]
 	if !ok {
-		pl = planLimits["default"]
+		pl = hardcodedLimits["default"]
 	}
 	switch provider {
 	case "facebook":
@@ -39,12 +78,23 @@ func LimitFor(plan, provider string) int {
 	return 0
 }
 
-// LimitsForPlan returns the full table for one plan, useful for UI hints
-// like "your plan allows N Facebook pages".
+// hardcodedLimits are bootstrap values used before the plans collection is
+// seeded, and as the ultimate fallback.
+var hardcodedLimits = map[string]PlanLimit{
+	"free":       {Facebook: 1, Line: 1},
+	"starter":    {Facebook: 1, Line: 1},
+	"basic":      {Facebook: 3, Line: 1},
+	"growth":     {Facebook: 5, Line: 3},
+	"pro":        {Facebook: 10, Line: 5},
+	"enterprise": {Facebook: 100, Line: 100},
+	"default":    {Facebook: 1, Line: 1},
+}
+
+// LimitsForPlan returns the full hardcoded table for one plan.
 func LimitsForPlan(plan string) PlanLimit {
-	pl, ok := planLimits[plan]
+	pl, ok := hardcodedLimits[plan]
 	if !ok {
-		return planLimits["default"]
+		return hardcodedLimits["default"]
 	}
 	return pl
 }

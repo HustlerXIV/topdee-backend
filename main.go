@@ -20,6 +20,7 @@ import (
 	"github.com/topdee/backend/internal/db"
 	"github.com/topdee/backend/internal/handlers"
 	"github.com/topdee/backend/internal/middleware"
+	"github.com/topdee/backend/internal/realtime"
 )
 
 func main() {
@@ -43,6 +44,8 @@ func main() {
 
 	aiClient := clients.NewAIClient(cfg.AIServiceURL)
 
+	hub := realtime.NewHub()
+
 	orch := handlers.NewOrchestrator(mongo, aiClient, cfg)
 
 	// Channel provider registry — adding a new social platform is one
@@ -63,6 +66,11 @@ func main() {
 		}
 	}
 
+	// Seed default plans if the collection is empty.
+	if err := handlers.SeedDefaultPlans(mongo); err != nil {
+		log.Printf("plans: seed error (non-fatal): %v", err)
+	}
+
 	app := fiber.New(fiber.Config{
 		AppName:      "topdee-backend",
 		BodyLimit:    25 * 1024 * 1024, // 25MB to allow PDF uploads
@@ -71,12 +79,20 @@ func main() {
 	app.Use(recover.New())
 	app.Use(logger.New())
 	app.Use(cors.New(cors.Config{
-		AllowOrigins: "*",
+		AllowOrigins: cfg.AllowOrigins,
 		AllowHeaders: "Origin, Content-Type, Accept, Authorization",
+		AllowMethods: "GET, POST, PUT, PATCH, DELETE, OPTIONS",
 	}))
 
 	// public
 	app.Get("/health", handlers.Health(mongo, aiClient))
+
+	// WebSocket — /ws?token=<jwt>
+	// Browsers can't send Authorization headers on WS connections so we
+	// authenticate via the JWT query param. The hub fans out inbox_update
+	// events to all connected dashboard tabs in the same tenant.
+	app.Use("/ws", handlers.WSUpgrade())
+	app.Get("/ws", handlers.WSHandler(hub, cfg))
 
 	api := app.Group("/api/v1")
 
@@ -85,8 +101,12 @@ func main() {
 	api.Post("/auth/register", authH.Register)
 	api.Post("/auth/login", authH.Login)
 
+	// Public plans — no auth, used by homepage and billing page.
+	api.Get("/plans", handlers.PublicPlans(mongo))
+
 	// Public accept-invite — exchanges a token for a new user + JWT.
 	teamH := handlers.NewTeamHandler(mongo, cfg)
+	api.Get("/auth/invite-info", teamH.InviteInfo)
 	api.Post("/auth/accept-invite", teamH.AcceptInvite)
 
 	// Auth-gated routes. Once `api.Use(RequireAuth)` runs, every subsequent
@@ -106,6 +126,11 @@ func main() {
 	protected.Get("/admin/users", middleware.RequireAdmin(), adminH.ListUsers)
 	protected.Patch("/admin/users/:id", middleware.RequireAdmin(), adminH.UpdateUser)
 	protected.Delete("/admin/users/:id", middleware.RequireAdmin(), adminH.DeleteUser)
+	protected.Get("/admin/plans", middleware.RequireAdmin(), adminH.ListPlans)
+	protected.Post("/admin/plans", middleware.RequireAdmin(), adminH.CreatePlan)
+	protected.Get("/admin/plans/:id", middleware.RequireAdmin(), adminH.GetPlan)
+	protected.Put("/admin/plans/:id", middleware.RequireAdmin(), adminH.UpdatePlan)
+	protected.Delete("/admin/plans/:id", middleware.RequireAdmin(), adminH.DeletePlan)
 
 	// Knowledge bases
 	kbH := handlers.NewKnowledgeHandler(mongo, aiClient)
@@ -119,6 +144,13 @@ func main() {
 	botH := handlers.NewBotHandler(mongo, cfg)
 	protected.Get("/bot", botH.Get)
 	protected.Put("/bot", botH.Update)
+
+	// Settings — current user's account, password, and workspace profile.
+	settingsH := handlers.NewSettingsHandler(mongo)
+	protected.Get("/settings", settingsH.Get)
+	protected.Patch("/settings/account", settingsH.UpdateAccount)
+	protected.Patch("/settings/password", settingsH.UpdatePassword)
+	protected.Patch("/settings/workspace", settingsH.UpdateWorkspace)
 
 	// Team — members + invites. Anyone in the workspace can list members,
 	// but write operations are gated to owner/admin via RequireRole.
@@ -148,6 +180,10 @@ func main() {
 	protected.Get("/channels/facebook/oauth/pages", chH.FacebookOAuthPages)
 	protected.Post("/channels/facebook/oauth/connect", chH.FacebookOAuthConnect)
 
+	// Analytics — real stats from the messages collection.
+	analyticsH := handlers.NewAnalyticsHandler(mongo)
+	protected.Get("/analytics", analyticsH.GetStats)
+
 	// Playground (in-dashboard test chat)
 	pgH := handlers.NewPlaygroundHandler(orch, mongo)
 	protected.Post("/playground/chat", pgH.Send)
@@ -158,15 +194,25 @@ func main() {
 	// (Playground messages are excluded server-side.) The handler needs
 	// the channel registry + store too so it can dispatch outbound
 	// human-agent replies through the right provider's push API.
-	inboxH := handlers.NewInboxHandler(mongo, channelRegistry, channelStore)
+	inboxH := handlers.NewInboxHandler(mongo, channelRegistry, channelStore, hub)
+	protected.Get("/inbox/unread-count", inboxH.UnreadCount)
 	protected.Get("/inbox/conversations", inboxH.ListConversations)
+	protected.Get("/inbox/media/:id", inboxH.GetMedia)
 	protected.Get("/inbox/conversations/:id/messages", inboxH.GetMessages)
 	protected.Post("/inbox/conversations/:id/messages", inboxH.SendMessage)
 
 	// Stripe billing — tenant-scoped self-service.
 	billingH := handlers.NewBillingHandler(mongo, cfg)
+	protected.Get("/billing", billingH.GetInfo)
 	protected.Post("/billing/checkout-session", billingH.CreateCheckoutSession)
 	protected.Post("/billing/portal-session", billingH.CreatePortalSession)
+	protected.Get("/billing/payment-methods", billingH.ListPaymentMethods)
+	protected.Delete("/billing/payment-methods/:id", billingH.RemovePaymentMethod)
+	protected.Post("/billing/cancel", billingH.CancelSubscription)
+	protected.Post("/billing/reactivate", billingH.ReactivateSubscription)
+	protected.Post("/billing/sync-session", billingH.SyncCheckoutSession)
+	protected.Post("/billing/promptpay-checkout", billingH.CreatePromptPayCheckout)
+	protected.Get("/billing/invoices", billingH.ListInvoices)
 
 	// Public webhooks (secured by signature verification). The generic
 	// /webhooks/:provider route covers every social platform via the
@@ -181,11 +227,35 @@ func main() {
 	//   /webhooks/<provider>/<external_id>   — per-connection URL pasted
 	//                                          into the customer's console
 	//                                          (LINE channel_id, etc.).
-	webhookHandler := handlers.WebhookHandler(channelRegistry, channelStore, mongo, orch, cfg)
+	webhookHandler := handlers.WebhookHandler(channelRegistry, channelStore, mongo, orch, cfg, hub)
 	webhooks.Get("/:provider", webhookHandler)
 	webhooks.Post("/:provider", webhookHandler)
 	webhooks.Get("/:provider/:external_id", webhookHandler)
 	webhooks.Post("/:provider/:external_id", webhookHandler)
+
+	// Background subscription expiry sweep.
+	//
+	// Runs once at startup (to catch any lapsed tenants from downtime) and
+	// then every hour. This is the safety net for missed Stripe webhooks and
+	// for admin-assigned plans with expiry_days.
+	go func() {
+		run := func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			n, err := handlers.ExpireSubscriptions(ctx, mongo)
+			if err != nil {
+				log.Printf("[expiry] sweep error: %v", err)
+			} else if n > 0 {
+				log.Printf("[expiry] downgraded %d tenant(s) to free plan", n)
+			}
+		}
+		run() // immediate pass on startup
+		ticker := time.NewTicker(1 * time.Hour)
+		defer ticker.Stop()
+		for range ticker.C {
+			run()
+		}
+	}()
 
 	// graceful shutdown
 	go func() {

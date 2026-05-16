@@ -151,8 +151,12 @@ type User struct {
 	// still tied to a tenant for normal product use.
 	IsPlatformAdmin bool `bson:"is_platform_admin" json:"is_platform_admin"`
 	// Suspended users cannot login. Flipped by a platform admin.
-	Suspended bool      `bson:"suspended" json:"suspended"`
-	CreatedAt time.Time `bson:"created_at" json:"created_at"`
+	Suspended bool `bson:"suspended" json:"suspended"`
+	// Password-reset state. Token is stored as a SHA-256 hash so even if the
+	// DB is read by an attacker the plaintext token (sent by email) is safe.
+	PasswordResetTokenHash string     `bson:"password_reset_token_hash,omitempty" json:"-"`
+	PasswordResetExpiresAt *time.Time `bson:"password_reset_expires_at,omitempty" json:"-"`
+	CreatedAt              time.Time  `bson:"created_at" json:"created_at"`
 }
 
 // TeamInvite — a pending or completed invitation to join a tenant.

@@ -226,7 +226,7 @@ func (o *Orchestrator) HandleIncoming(
 			[]string{"owner", "admin", "agent"},
 			"new_chat",
 			"💬 New message from a customer — "+tenantName,
-			email.NewChatHTML(tenantName, externalUserID, preview, channel),
+			email.NewChatHTML(tenantName, externalUserID, preview, channel, o.cfg.FrontendBaseURL),
 		)
 	}
 
@@ -441,7 +441,7 @@ func (o *Orchestrator) flagHandoff(tenantID, conversationID string) {
 			[]string{"owner", "admin", "agent"},
 			"ai_cant_answer",
 			"⚠ AI couldn't answer — customer needs help ("+t.Name+")",
-			email.AICantAnswerHTML(t.Name, lastMsg.ExternalUserID, lastMsg.Content, lastMsg.Channel),
+			email.AICantAnswerHTML(t.Name, lastMsg.ExternalUserID, lastMsg.Content, lastMsg.Channel, o.cfg.FrontendBaseURL),
 		)
 	}
 
@@ -1002,7 +1002,7 @@ func (o *Orchestrator) checkMonthlyQuota(ctx context.Context, tenant models.Tena
 			[]string{"owner"},
 			"quota_warning",
 			fmt.Sprintf("⚡ %d%% of monthly AI quota used — %s", int(used)*100/limit, tenant.Name),
-			email.QuotaWarningHTML(tenant.Name, int(used), limit, nextPlanName),
+			email.QuotaWarningHTML(tenant.Name, int(used), limit, nextPlanName, o.cfg.FrontendBaseURL),
 		)
 	}
 

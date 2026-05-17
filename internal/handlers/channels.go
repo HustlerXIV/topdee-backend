@@ -136,6 +136,19 @@ func (h *ChannelsHandler) List(c *fiber.Ctx) error {
 func (h *ChannelsHandler) Disconnect(c *fiber.Ctx) error {
 	tid := middleware.TenantID(c)
 	id := c.Params("id")
+
+	// Fetch before deleting so we know provider + external_id. We need these
+	// to also clear the legacy tenant.line / tenant.facebook sub-document —
+	// the startup migration reads those fields and would silently re-create
+	// this connection on every backend restart if we leave them in place.
+	conn, err := h.store.FindForTenant(c.Context(), tid, id)
+	if err != nil {
+		return err
+	}
+	if conn == nil {
+		return fiber.NewError(fiber.StatusNotFound, "connection not found")
+	}
+
 	ok, err := h.store.Delete(c.Context(), tid, id)
 	if err != nil {
 		return err
@@ -143,6 +156,22 @@ func (h *ChannelsHandler) Disconnect(c *fiber.Ctx) error {
 	if !ok {
 		return fiber.NewError(fiber.StatusNotFound, "connection not found")
 	}
+
+	// Clear the matching legacy field from the tenant document so the
+	// startup migration never re-creates this connection.
+	switch conn.Provider {
+	case models.ProviderLine:
+		h.mongo.DB.Collection("tenants").UpdateOne(c.Context(),
+			bson.M{"_id": tid, "line.channel_id": conn.ExternalID},
+			bson.M{"$unset": bson.M{"line": ""}},
+		)
+	case models.ProviderFacebook:
+		h.mongo.DB.Collection("tenants").UpdateOne(c.Context(),
+			bson.M{"_id": tid, "facebook.page_id": conn.ExternalID},
+			bson.M{"$unset": bson.M{"facebook": ""}},
+		)
+	}
+
 	return c.SendStatus(fiber.StatusNoContent)
 }
 

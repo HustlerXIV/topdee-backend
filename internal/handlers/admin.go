@@ -220,6 +220,29 @@ func (h *AdminHandler) UpdateTenant(c *fiber.Ctx) error {
 		switch *req.Plan {
 		case "free", "starter", "growth", "pro", "enterprise":
 			set["plan"] = *req.Plan
+			// When an admin manually assigns a paid plan, promote the
+			// subscription to "active" and clear any leftover trial dates so
+			// the tenant doesn't show "EnterpriseTrial" (or similar) in the UI.
+			// Free plan keeps whatever subscription state it already has.
+			if *req.Plan != "free" {
+				now := time.Now().UTC()
+				set["subscription.status"] = models.SubStatusActive
+				set["subscription.trial_ends_at"] = nil
+				set["subscription.updated_at"] = now
+
+				// If the plan has expiry_days set, stamp current_period_end
+				// so the billing page shows "expires on <date>". Otherwise
+				// clear any stale date left over from a previous trial.
+				var planDoc models.Plan
+				if err := h.mongo.DB.Collection("plans").
+					FindOne(c.Context(), bson.M{"_id": *req.Plan}).
+					Decode(&planDoc); err == nil && planDoc.ExpiryDays > 0 {
+					periodEnd := now.AddDate(0, 0, planDoc.ExpiryDays)
+					set["subscription.current_period_end"] = periodEnd
+				} else {
+					set["subscription.current_period_end"] = nil
+				}
+			}
 		default:
 			return fiber.NewError(fiber.StatusBadRequest, "invalid plan")
 		}

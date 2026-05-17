@@ -378,7 +378,7 @@ func (h *ChannelsHandler) FacebookOAuthConnect(c *fiber.Ctx) error {
 	if err != nil {
 		return err
 	}
-	if int(used)+len(req.PageIDs) > limit {
+	if limit >= 0 && int(used)+len(req.PageIDs) > limit {
 		return fiber.NewError(
 			fiber.StatusForbidden,
 			"this plan allows up to "+itoa(limit)+" Facebook pages",
@@ -449,7 +449,7 @@ func (h *ChannelsHandler) enforceLimit(c *fiber.Ctx, tid, provider, externalID s
 	if err != nil {
 		return err
 	}
-	if int(used) >= limit {
+	if limit >= 0 && int(used) >= limit {
 		return fiber.NewError(
 			fiber.StatusForbidden,
 			"this plan allows up to "+itoa(limit)+" "+provider+" connections",

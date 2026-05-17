@@ -156,7 +156,10 @@ type User struct {
 	// DB is read by an attacker the plaintext token (sent by email) is safe.
 	PasswordResetTokenHash string     `bson:"password_reset_token_hash,omitempty" json:"-"`
 	PasswordResetExpiresAt *time.Time `bson:"password_reset_expires_at,omitempty" json:"-"`
-	CreatedAt              time.Time  `bson:"created_at" json:"created_at"`
+	// PrivacyAcceptedAt records when the user agreed to the Privacy Policy
+	// during registration. Nil for users created before this field was added.
+	PrivacyAcceptedAt *time.Time `bson:"privacy_accepted_at,omitempty" json:"privacy_accepted_at,omitempty"`
+	CreatedAt         time.Time  `bson:"created_at" json:"created_at"`
 }
 
 // TeamInvite — a pending or completed invitation to join a tenant.

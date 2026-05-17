@@ -127,8 +127,6 @@ func Load() (*Config, error) {
 		FrontendBaseURL:  getEnv("FRONTEND_BASE_URL", "http://localhost:3000"),
 		BackendPublicURL: getEnv("BACKEND_PUBLIC_URL", "http://localhost:8080"),
 
-		AcceptInviteBaseURL: getEnv("ACCEPT_INVITE_BASE_URL", "http://localhost:3000/accept-invite"),
-
 		BootstrapAdminEmails: parseEmailList(getEnv("BOOTSTRAP_ADMIN_EMAILS", "")),
 
 		ResendAPIKey: getEnv("RESEND_API_KEY", ""),
@@ -140,7 +138,6 @@ func Load() (*Config, error) {
 
 		StripeSecretKey:     getEnv("STRIPE_SECRET_KEY", ""),
 		StripeWebhookSecret: getEnv("STRIPE_WEBHOOK_SECRET", ""),
-		BillingReturnURL:    getEnv("BILLING_RETURN_URL", "http://localhost:3000/billing"),
 
 		AllowOrigins: getEnv("CORS_ALLOW_ORIGINS", "*"),
 
@@ -150,6 +147,12 @@ func Load() (*Config, error) {
 		R2Bucket:    getEnv("R2_BUCKET", ""),
 		R2PublicURL: getEnv("R2_PUBLIC_URL", ""),
 	}
+	// Derive URL-based config from FRONTEND_BASE_URL so operators only need
+	// to set one env var instead of three. Individual vars still override.
+	frontendBase := strings.TrimRight(c.FrontendBaseURL, "/")
+	c.AcceptInviteBaseURL = getEnvOr("ACCEPT_INVITE_BASE_URL", frontendBase+"/accept-invite")
+	c.BillingReturnURL = getEnvOr("BILLING_RETURN_URL", frontendBase+"/billing")
+
 	ttl, _ := strconv.Atoi(getEnv("JWT_TTL_HOURS", "24"))
 	if ttl <= 0 {
 		ttl = 24
@@ -173,6 +176,16 @@ func getEnv(k, def string) string {
 		return v
 	}
 	return def
+}
+
+// getEnvOr returns the env var if set, otherwise the provided fallback.
+// Same as getEnv but the fallback is computed at call-site (not a constant),
+// which is needed when the fallback is derived from another config field.
+func getEnvOr(k, fallback string) string {
+	if v := os.Getenv(k); v != "" {
+		return v
+	}
+	return fallback
 }
 
 // parseEmailList splits a comma-separated env var into normalized emails.

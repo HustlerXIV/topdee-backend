@@ -60,7 +60,8 @@ func (m *Mailer) Send(to, subject, html string) error {
 
 // NewChatHTML returns the HTML body for a "new customer message" notification.
 // channel is the provider slug ("line" / "facebook" / etc.).
-func NewChatHTML(workspaceName, customerName, preview, channel string) string {
+// appURL is the frontend base URL, e.g. "https://app.example.com".
+func NewChatHTML(workspaceName, customerName, preview, channel, appURL string) string {
 	channelLabel := channel
 	switch channel {
 	case "line":
@@ -95,7 +96,7 @@ func NewChatHTML(workspaceName, customerName, preview, channel string) string {
         </div>
         <table cellpadding="0" cellspacing="0" style="margin:0 0 20px;">
           <tr><td style="background:#6366f1;border-radius:10px;">
-            <a href="https://app.topdee.com/inbox"
+            <a href="%s/inbox"
                style="display:inline-block;padding:13px 28px;font-size:14px;font-weight:700;color:#ffffff;text-decoration:none;">
               View in inbox →
             </a>
@@ -116,13 +117,15 @@ func NewChatHTML(workspaceName, customerName, preview, channel string) string {
 		channelLabel,
 		customerName,
 		preview,
+		appURL,
 		workspaceName,
 		time.Now().Year(),
 	)
 }
 
 // AICantAnswerHTML returns the HTML body for an "AI couldn't answer" handoff notification.
-func AICantAnswerHTML(workspaceName, customerName, preview, channel string) string {
+// appURL is the frontend base URL, e.g. "https://app.example.com".
+func AICantAnswerHTML(workspaceName, customerName, preview, channel, appURL string) string {
 	channelLabel := channel
 	switch channel {
 	case "line":
@@ -160,7 +163,7 @@ func AICantAnswerHTML(workspaceName, customerName, preview, channel string) stri
         </div>
         <table cellpadding="0" cellspacing="0" style="margin:0 0 20px;">
           <tr><td style="background:#f97316;border-radius:10px;">
-            <a href="https://app.topdee.com/inbox"
+            <a href="%s/inbox"
                style="display:inline-block;padding:13px 28px;font-size:14px;font-weight:700;color:#ffffff;text-decoration:none;">
               Open conversation →
             </a>
@@ -180,13 +183,15 @@ func AICantAnswerHTML(workspaceName, customerName, preview, channel string) stri
 		channelLabel,
 		customerName,
 		preview,
+		appURL,
 		workspaceName,
 		time.Now().Year(),
 	)
 }
 
 // QuotaWarningHTML returns the HTML body for an 80% monthly quota warning.
-func QuotaWarningHTML(workspaceName string, used, limit int, nextPlan string) string {
+// appURL is the frontend base URL, e.g. "https://app.example.com".
+func QuotaWarningHTML(workspaceName string, used, limit int, nextPlan, appURL string) string {
 	pct := 0
 	if limit > 0 {
 		pct = used * 100 / limit
@@ -196,12 +201,12 @@ func QuotaWarningHTML(workspaceName string, used, limit int, nextPlan string) st
 		upgradeRow = fmt.Sprintf(`
         <table cellpadding="0" cellspacing="0" style="margin:20px 0 0;">
           <tr><td style="background:#6366f1;border-radius:10px;">
-            <a href="https://app.topdee.com/billing"
+            <a href="%s/billing"
                style="display:inline-block;padding:13px 28px;font-size:14px;font-weight:700;color:#ffffff;text-decoration:none;">
               Upgrade to %s →
             </a>
           </td></tr>
-        </table>`, nextPlan)
+        </table>`, appURL, nextPlan)
 	}
 	return fmt.Sprintf(`<!DOCTYPE html>
 <html lang="en">

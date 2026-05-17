@@ -31,7 +31,7 @@ func NewBotHandler(m *db.Mongo, cfg *config.Config) *BotHandler {
 // Reject anything off-list to keep the UI selects aligned with the API.
 
 var (
-	allowedLanguages = map[string]bool{"th": true, "en": true, "mix": true}
+	allowedLanguages = map[string]bool{"th": true, "en": true, "mix": true, "auto": true}
 	allowedPersonas  = map[string]bool{
 		"friendly": true, "formal": true, "fun": true, "concise": true,
 	}

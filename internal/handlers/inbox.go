@@ -422,6 +422,17 @@ func (h *InboxHandler) SendMessage(c *fiber.Ctx) error {
 		return fiber.NewError(fiber.StatusBadGateway, "send failed: "+err.Error())
 	}
 
+	// Look up the sender's display name so the inbox can show the correct
+	// team member name on each message instead of the viewer's own name.
+	senderName := middleware.Email(c) // fallback to email if name lookup fails
+	var sender models.User
+	if err := h.mongo.DB.Collection("users").
+		FindOne(c.Context(), bson.M{"_id": uid, "tenant_id": tid},
+			options.FindOne().SetProjection(bson.M{"name": 1}),
+		).Decode(&sender); err == nil && sender.Name != "" {
+		senderName = sender.Name
+	}
+
 	msg := models.Message{
 		ID:             uuid.NewString(),
 		TenantID:       tid,
@@ -430,6 +441,7 @@ func (h *InboxHandler) SendMessage(c *fiber.Ctx) error {
 		Content:        text,
 		Channel:        providerName,
 		ExternalUserID: externalUserID,
+		SenderName:     senderName,
 		Metadata: map[string]any{
 			"sent_by_user_id": uid,
 		},

@@ -25,9 +25,12 @@ type Message struct {
 	Content        string         `bson:"content" json:"content"`
 	Channel        string         `bson:"channel" json:"channel"` // dashboard | facebook | line
 	ExternalUserID string         `bson:"external_user_id,omitempty" json:"external_user_id,omitempty"`
-	Attachments    []Attachment   `bson:"attachments,omitempty" json:"attachments,omitempty"`
-	Metadata       map[string]any `bson:"metadata,omitempty" json:"metadata,omitempty"`
-	CreatedAt      time.Time      `bson:"created_at" json:"created_at"`
+	// SenderName is the display name of the team member who sent this message
+	// (role=human). Empty for AI, user, and suggestion messages.
+	SenderName  string         `bson:"sender_name,omitempty" json:"sender_name,omitempty"`
+	Attachments []Attachment   `bson:"attachments,omitempty" json:"attachments,omitempty"`
+	Metadata    map[string]any `bson:"metadata,omitempty" json:"metadata,omitempty"`
+	CreatedAt   time.Time      `bson:"created_at" json:"created_at"`
 }
 
 type Attachment struct {

@@ -30,9 +30,12 @@ func NewAuthHandler(m *db.Mongo, c *config.Config) *AuthHandler {
 }
 
 type registerReq struct {
-	TenantName string `json:"tenant_name"`
-	Email      string `json:"email"`
-	Password   string `json:"password"`
+	TenantName      string `json:"tenant_name"`
+	Email           string `json:"email"`
+	Password        string `json:"password"`
+	// AcceptedPrivacy must be true for registration to succeed.
+	// The timestamp is stored on the user record for legal compliance.
+	AcceptedPrivacy bool   `json:"accepted_privacy"`
 }
 
 // isBootstrapAdmin returns true if the email is in BOOTSTRAP_ADMIN_EMAILS.
@@ -55,6 +58,9 @@ func (h *AuthHandler) Register(c *fiber.Ctx) error {
 	}
 	if req.TenantName == "" || req.Email == "" || len(req.Password) < 8 {
 		return fiber.NewError(fiber.StatusBadRequest, "tenant_name, email, password (>=8) required")
+	}
+	if !req.AcceptedPrivacy {
+		return fiber.NewError(fiber.StatusBadRequest, "you must accept the Privacy Policy to register")
 	}
 
 	now := time.Now().UTC()
@@ -95,13 +101,14 @@ func (h *AuthHandler) Register(c *fiber.Ctx) error {
 		return err
 	}
 	user := models.User{
-		ID:              uuid.NewString(),
-		TenantID:        tenant.ID,
-		Email:           req.Email,
-		PasswordHash:    string(hash),
-		Role:            "owner",
-		IsPlatformAdmin: h.isBootstrapAdmin(req.Email),
-		CreatedAt:       now,
+		ID:                uuid.NewString(),
+		TenantID:          tenant.ID,
+		Email:             req.Email,
+		PasswordHash:      string(hash),
+		Role:              "owner",
+		IsPlatformAdmin:   h.isBootstrapAdmin(req.Email),
+		PrivacyAcceptedAt: &now,
+		CreatedAt:         now,
 	}
 	if _, err := h.mongo.DB.Collection("users").InsertOne(c.Context(), user); err != nil {
 		// duplicate email

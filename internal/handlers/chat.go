@@ -785,6 +785,8 @@ func languageHint(lang string) string {
 		return "Always reply in English unless the customer writes in another language."
 	case "mix":
 		return "Reply in whichever language the customer used (Thai or English)."
+	case "auto":
+		return "Detect the language the customer wrote in and always reply in that same language, regardless of what language it is."
 	default:
 		return ""
 	}

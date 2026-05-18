@@ -206,6 +206,28 @@ func linePush(ctx context.Context, token, userID, text string) error {
 	return doLinePost(ctx, "https://api.line.me/v2/bot/message/push", token, body)
 }
 
+// SendImage implements channels.ImageSender. It always uses the push API
+// (images have no reply-token equivalent in LINE).
+func (LineProvider) SendImage(ctx context.Context, conn *models.ChannelConnection, evt ParsedEvent, imageURL string) error {
+	token := conn.Credentials["channel_access_token"]
+	if token == "" {
+		return fmt.Errorf("line send image: no access token (refresh failed)")
+	}
+	return linePushImage(ctx, token, evt.ExternalUserID, imageURL)
+}
+
+func linePushImage(ctx context.Context, token, userID, imageURL string) error {
+	body, _ := json.Marshal(map[string]any{
+		"to": userID,
+		"messages": []map[string]any{{
+			"type":               "image",
+			"originalContentUrl": imageURL,
+			"previewImageUrl":    imageURL,
+		}},
+	})
+	return doLinePost(ctx, "https://api.line.me/v2/bot/message/push", token, body)
+}
+
 func doLinePost(ctx context.Context, url, token string, body []byte) error {
 	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(body))
 	if err != nil {

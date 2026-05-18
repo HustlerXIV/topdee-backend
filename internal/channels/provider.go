@@ -134,3 +134,14 @@ var ErrUnknownProvider = errors.New("unknown provider")
 type CredentialRefresher interface {
 	EnsureCredentials(ctx context.Context, conn *models.ChannelConnection) (refreshed bool, err error)
 }
+
+// ImageSender is an *optional* extension to Provider for platforms that
+// support sending image messages. Providers that don't support images
+// just don't implement this interface — the inbox handler will fall back
+// to a "not supported" error in that case.
+//
+// imageURL must be a publicly accessible HTTPS URL (already uploaded to R2
+// or another CDN); the provider SDK/API will fetch it.
+type ImageSender interface {
+	SendImage(ctx context.Context, conn *models.ChannelConnection, evt ParsedEvent, imageURL string) error
+}

@@ -187,9 +187,6 @@ func (h *GoogleAuthHandler) fetchGoogleProfile(code string) (*googleProfile, err
 // ── Find or create ────────────────────────────────────────────────────────────
 
 func (h *GoogleAuthHandler) findOrCreateUser(ctx context.Context, p *googleProfile) (token string, isNew bool, err error) {
-	if !p.EmailVerified {
-		return "", false, fmt.Errorf("google account email is not verified")
-	}
 	// Look up by email.
 	var u models.User
 	dbErr := h.mongo.DB.Collection("users").

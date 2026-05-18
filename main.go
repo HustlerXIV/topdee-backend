@@ -204,12 +204,13 @@ func main() {
 	// (Playground messages are excluded server-side.) The handler needs
 	// the channel registry + store too so it can dispatch outbound
 	// human-agent replies through the right provider's push API.
-	inboxH := handlers.NewInboxHandler(mongo, channelRegistry, channelStore, hub)
+	inboxH := handlers.NewInboxHandler(mongo, channelRegistry, channelStore, hub, cfg)
 	protected.Get("/inbox/unread-count", inboxH.UnreadCount)
 	protected.Get("/inbox/conversations", inboxH.ListConversations)
 	protected.Get("/inbox/media/:id", inboxH.GetMedia)
 	protected.Get("/inbox/conversations/:id/messages", inboxH.GetMessages)
 	protected.Post("/inbox/conversations/:id/messages", inboxH.SendMessage)
+	protected.Post("/inbox/conversations/:id/images", inboxH.SendImage)
 	protected.Patch("/inbox/conversations/:id/resolve", inboxH.ResolveHandoff)
 
 	// Stripe billing — tenant-scoped self-service.

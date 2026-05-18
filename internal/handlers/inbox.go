@@ -14,10 +14,12 @@ package handlers
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"net/url"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -27,6 +29,7 @@ import (
 	"go.mongodb.org/mongo-driver/mongo/options"
 
 	"github.com/topdee/backend/internal/channels"
+	"github.com/topdee/backend/internal/config"
 	"github.com/topdee/backend/internal/db"
 	"github.com/topdee/backend/internal/middleware"
 	"github.com/topdee/backend/internal/models"
@@ -38,10 +41,15 @@ type InboxHandler struct {
 	registry *channels.Registry
 	store    *channels.Store
 	hub      *realtime.Hub
+	cfg      *config.Config
 }
 
-func NewInboxHandler(m *db.Mongo, reg *channels.Registry, store *channels.Store, hub *realtime.Hub) *InboxHandler {
-	return &InboxHandler{mongo: m, registry: reg, store: store, hub: hub}
+func NewInboxHandler(m *db.Mongo, reg *channels.Registry, store *channels.Store, hub *realtime.Hub, cfg ...*config.Config) *InboxHandler {
+	h := &InboxHandler{mongo: m, registry: reg, store: store, hub: hub}
+	if len(cfg) > 0 {
+		h.cfg = cfg[0]
+	}
+	return h
 }
 
 // UnreadCount returns the number of conversations where the customer spoke
@@ -455,6 +463,152 @@ func (h *InboxHandler) SendMessage(c *fiber.Ctx) error {
 	// handled so the badge should drop.
 	go h.broadcastUnread(tid)
 
+	return c.JSON(msg)
+}
+
+// SendImage uploads an image file to R2 and dispatches it to the customer
+// through the right platform's API (LINE push image, FB attachment).
+//
+// POST /api/v1/inbox/conversations/:id/images  (multipart/form-data)
+//
+//	form field: "image" — the file to send (≤ 10 MB, image/* only)
+func (h *InboxHandler) SendImage(c *fiber.Ctx) error {
+	if h.cfg == nil {
+		return fiber.NewError(fiber.StatusServiceUnavailable, "image upload not configured")
+	}
+
+	tid := middleware.TenantID(c)
+	uid := middleware.UserID(c)
+	convID := conversationIDParam(c)
+	if convID == "" {
+		return fiber.NewError(fiber.StatusBadRequest, "missing conversation id")
+	}
+
+	// ── Parse upload ──────────────────────────────────────────────────
+	fh, err := c.FormFile("image")
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "image file required")
+	}
+	const maxBytes = 10 << 20 // 10 MB
+	if fh.Size > maxBytes {
+		return fiber.NewError(fiber.StatusBadRequest, "image must be ≤ 10 MB")
+	}
+
+	f, err := fh.Open()
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "could not read file")
+	}
+	defer f.Close()
+	imgBytes, err := io.ReadAll(io.LimitReader(f, maxBytes+1))
+	if err != nil {
+		return err
+	}
+	if int64(len(imgBytes)) > maxBytes {
+		return fiber.NewError(fiber.StatusBadRequest, "image must be ≤ 10 MB")
+	}
+
+	ct := fh.Header.Get("Content-Type")
+	if ct == "" || !strings.HasPrefix(ct, "image/") {
+		ct = "image/jpeg"
+	}
+	ext := filepath.Ext(fh.Filename)
+	if ext == "" {
+		ext = ".jpg"
+	}
+	key := fmt.Sprintf("inbox/%s/%s%s", tid, uuid.NewString(), ext)
+
+	r2 := &r2Client{
+		accountID: h.cfg.R2AccountID,
+		accessKey: h.cfg.R2AccessKey,
+		secretKey: h.cfg.R2SecretKey,
+		bucket:    h.cfg.R2Bucket,
+		publicURL: h.cfg.R2PublicURL,
+	}
+	imageURL, err := r2.PutObject(key, ct, imgBytes)
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadGateway, "upload failed: "+err.Error())
+	}
+
+	// ── Resolve provider + connection ─────────────────────────────────
+	providerName, externalChannelID, externalUserID, ok := parseConversationID(convID)
+	if !ok {
+		return fiber.NewError(fiber.StatusBadRequest, "malformed conversation id")
+	}
+
+	provider, ok := h.registry.Get(providerName)
+	if !ok {
+		return fiber.NewError(fiber.StatusBadRequest, "unknown provider: "+providerName)
+	}
+
+	conn, err := h.store.FindByExternal(c.Context(), providerName, externalChannelID)
+	if err != nil {
+		return err
+	}
+	if conn == nil || conn.TenantID != tid {
+		return fiber.NewError(fiber.StatusNotFound, "channel connection not found")
+	}
+
+	// Refresh credentials if the provider supports it (e.g. LINE).
+	if r, ok := provider.(channels.CredentialRefresher); ok {
+		if refreshed, err := r.EnsureCredentials(c.Context(), conn); err != nil {
+			return fiber.NewError(fiber.StatusBadGateway, "could not refresh credentials: "+err.Error())
+		} else if refreshed {
+			if err := h.store.UpdateCredentials(c.Context(), conn.ID, conn.Credentials); err != nil {
+				log.Printf("inbox sendimage: persist refreshed credentials: %v", err)
+			}
+		}
+	}
+
+	// ── Dispatch image to platform ────────────────────────────────────
+	imgSender, ok := provider.(channels.ImageSender)
+	if !ok {
+		return fiber.NewError(fiber.StatusBadRequest, "image sending not supported for provider: "+providerName)
+	}
+
+	evt := channels.ParsedEvent{
+		ExternalChannelID: externalChannelID,
+		ExternalUserID:    externalUserID,
+	}
+	if err := imgSender.SendImage(c.Context(), conn, evt, imageURL); err != nil {
+		_ = h.store.MarkError(c.Context(), conn.ID, err.Error())
+		return fiber.NewError(fiber.StatusBadGateway, "send image failed: "+err.Error())
+	}
+
+	// ── Persist as a message ──────────────────────────────────────────
+	senderName := middleware.Email(c)
+	var sender models.User
+	if err := h.mongo.DB.Collection("users").
+		FindOne(c.Context(), bson.M{"_id": uid, "tenant_id": tid},
+			options.FindOne().SetProjection(bson.M{"name": 1}),
+		).Decode(&sender); err == nil && sender.Name != "" {
+		senderName = sender.Name
+	}
+
+	msg := models.Message{
+		ID:             uuid.NewString(),
+		TenantID:       tid,
+		ConversationID: convID,
+		Role:           models.RoleHuman,
+		Content:        "", // no text; image only
+		Channel:        providerName,
+		ExternalUserID: externalUserID,
+		SenderName:     senderName,
+		Attachments: []models.Attachment{{
+			Type:        "image",
+			URL:         imageURL,
+			ContentType: ct,
+			Name:        fh.Filename,
+		}},
+		Metadata: map[string]any{
+			"sent_by_user_id": uid,
+		},
+		CreatedAt: time.Now().UTC(),
+	}
+	if _, err := h.mongo.DB.Collection("messages").InsertOne(c.Context(), msg); err != nil {
+		return err
+	}
+
+	go h.broadcastUnread(tid)
 	return c.JSON(msg)
 }
 

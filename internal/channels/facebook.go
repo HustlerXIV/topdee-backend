@@ -171,6 +171,41 @@ func (FacebookProvider) Send(ctx context.Context, conn *models.ChannelConnection
 	return nil
 }
 
+// SendImage implements channels.ImageSender using the FB Send API's
+// attachment payload. imageURL must be a public HTTPS URL.
+func (FacebookProvider) SendImage(ctx context.Context, conn *models.ChannelConnection, evt ParsedEvent, imageURL string) error {
+	token := conn.Credentials["page_access_token"]
+	if token == "" {
+		return fmt.Errorf("fb send image: missing page_access_token")
+	}
+	u := "https://graph.facebook.com/" + graphVersion + "/me/messages?access_token=" + url.QueryEscape(token)
+	body, _ := json.Marshal(map[string]any{
+		"recipient": map[string]string{"id": evt.ExternalUserID},
+		"message": map[string]any{
+			"attachment": map[string]any{
+				"type":    "image",
+				"payload": map[string]any{"url": imageURL, "is_reusable": true},
+			},
+		},
+		"messaging_type": "RESPONSE",
+	})
+	req, err := http.NewRequestWithContext(ctx, "POST", u, bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		rb, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("fb send image: %s: %s", resp.Status, string(rb))
+	}
+	return nil
+}
+
 // ── OAuth helpers ──────────────────────────────────────────────────────
 //
 // These are package-level functions (not provider methods) so the channels

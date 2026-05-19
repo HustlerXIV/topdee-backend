@@ -36,6 +36,10 @@ type Config struct {
 	FBAppSecret        string
 	FBVerifyToken      string
 	FBOAuthRedirectURI string
+	// IGOAuthRedirectURI — callback URL for the Instagram OAuth dance. Must be
+	// registered in the Meta app under "Facebook Login → Valid OAuth Redirect URIs".
+	// Typically `${BACKEND_PUBLIC_URL}/webhooks/instagram/oauth/callback`.
+	IGOAuthRedirectURI string
 
 	// FrontendBaseURL — used to build the post-OAuth redirect that brings
 	// the user back to the dashboard's channels page. Typically the same
@@ -123,6 +127,7 @@ func Load() (*Config, error) {
 		FBAppSecret:        getEnv("FB_APP_SECRET", ""),
 		FBVerifyToken:      getEnv("FB_VERIFY_TOKEN", ""),
 		FBOAuthRedirectURI: getEnv("FB_OAUTH_REDIRECT_URI", "http://localhost:8080/webhooks/facebook/oauth/callback"),
+		IGOAuthRedirectURI: getEnv("IG_OAUTH_REDIRECT_URI", "http://localhost:8080/webhooks/instagram/oauth/callback"),
 
 		FrontendBaseURL:  getEnv("FRONTEND_BASE_URL", "http://localhost:3000"),
 		BackendPublicURL: getEnv("BACKEND_PUBLIC_URL", "http://localhost:8080"),

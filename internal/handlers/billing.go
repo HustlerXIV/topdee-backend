@@ -15,6 +15,7 @@ package handlers
 
 import (
 	"context"
+	"fmt"
 	"sort"
 	"sync"
 	"time"
@@ -23,6 +24,7 @@ import (
 	"github.com/stripe/stripe-go/v79"
 	billingportal "github.com/stripe/stripe-go/v79/billingportal/session"
 	checkoutsession "github.com/stripe/stripe-go/v79/checkout/session"
+	stripecoupon "github.com/stripe/stripe-go/v79/coupon"
 	stripecustomer "github.com/stripe/stripe-go/v79/customer"
 	stripeinvoice "github.com/stripe/stripe-go/v79/invoice"
 	stripepaymentmethod "github.com/stripe/stripe-go/v79/paymentmethod"
@@ -162,6 +164,20 @@ func (h *BillingHandler) CreateCheckoutSession(c *fiber.Ctx) error {
 			},
 		},
 	}
+	// Apply referral discount when the tenant has a valid signup discount.
+	// Discounts and AllowPromotionCodes are mutually exclusive in Stripe, so
+	// we clear AllowPromotionCodes when we inject an explicit discount coupon.
+	if t.ReferralDiscountExpiresAt != nil && time.Now().UTC().Before(*t.ReferralDiscountExpiresAt) {
+		if settings, serr := loadReferralSettings(h.mongo, c.Context()); serr == nil && settings.DiscountPercent > 0 {
+			if couponID, cerr := ensureReferralCoupon(settings.DiscountPercent, settings.DiscountDurationMonths); cerr == nil {
+				params.Discounts = []*stripe.CheckoutSessionDiscountParams{
+					{Coupon: stripe.String(couponID)},
+				}
+				params.AllowPromotionCodes = nil // cannot coexist with Discounts
+			}
+		}
+	}
+
 	sess, err := checkoutsession.New(params)
 	if err != nil {
 		return fiber.NewError(fiber.StatusBadGateway, "stripe checkout: "+err.Error())
@@ -845,6 +861,45 @@ func (h *BillingHandler) ListInvoices(c *fiber.Ctx) error {
 		invoices = []invoiceView{}
 	}
 	return c.JSON(fiber.Map{"invoices": invoices})
+}
+
+// ── Referral coupon helper ────────────────────────────────────────────
+
+// ensureReferralCoupon finds or creates a Stripe coupon for the referral
+// signup discount. Uses a deterministic coupon ID so we reuse one object
+// across all checkout sessions rather than creating a new coupon every time.
+func ensureReferralCoupon(discountPercent, durationMonths int) (string, error) {
+	couponID := fmt.Sprintf("REFERRAL_%dPCT_%dMO", discountPercent, durationMonths)
+
+	// Try to fetch an existing valid coupon first.
+	existing, err := stripecoupon.Get(couponID, nil)
+	if err == nil && existing.Valid {
+		return couponID, nil
+	}
+
+	// Create the coupon — repeating for N months, or forever if months=0.
+	dur := stripe.CouponDurationRepeating
+	if durationMonths <= 0 {
+		dur = stripe.CouponDurationForever
+	}
+	cp := &stripe.CouponParams{
+		ID:         stripe.String(couponID),
+		PercentOff: stripe.Float64(float64(discountPercent)),
+		Duration:   &dur,
+		Name:       stripe.String(fmt.Sprintf("Referral signup discount — %d%% off", discountPercent)),
+	}
+	if durationMonths > 0 {
+		cp.DurationInMonths = stripe.Int64(int64(durationMonths))
+	}
+	c, err := stripecoupon.New(cp)
+	if err != nil {
+		// Race condition: coupon may have been created by a concurrent request.
+		if existing2, e2 := stripecoupon.Get(couponID, nil); e2 == nil {
+			return existing2.ID, nil
+		}
+		return "", fmt.Errorf("create referral coupon: %w", err)
+	}
+	return c.ID, nil
 }
 
 // ── Billing info ──────────────────────────────────────────────────────

@@ -6,13 +6,17 @@ package handlers
 // own collection now (channel_connections); a tenant can have many per
 // provider, capped by their plan tier.
 //
-//   GET    /api/v1/channels                           list all + plan limits
-//   DELETE /api/v1/channels/:id                       disconnect one
-//   PUT    /api/v1/channels/line                      connect a LINE OA (manual)
+//   GET    /api/v1/channels                              list all + plan limits
+//   DELETE /api/v1/channels/:id                          disconnect one
+//   PUT    /api/v1/channels/line                         connect a LINE OA (manual)
 //
-//   POST   /api/v1/channels/facebook/oauth/start      → { login_url }
-//   GET    /api/v1/channels/facebook/oauth/pages      list pages for a state
-//   POST   /api/v1/channels/facebook/oauth/connect    pick pages → connections
+//   POST   /api/v1/channels/facebook/oauth/start         → { login_url }
+//   GET    /api/v1/channels/facebook/oauth/pages         list pages for a state
+//   POST   /api/v1/channels/facebook/oauth/connect       pick pages → connections
+//
+//   POST   /api/v1/channels/instagram/oauth/start        → { login_url }
+//   GET    /api/v1/channels/instagram/oauth/accounts     list IG accounts for a state
+//   POST   /api/v1/channels/instagram/oauth/connect      pick accounts → connections
 
 import (
 	"context"
@@ -126,8 +130,9 @@ func (h *ChannelsHandler) List(c *fiber.Ctx) error {
 	}
 	pl := channels.LimitsForPlan(plan)
 	limits := map[string]int{
-		models.ProviderFacebook: pl.Facebook,
-		models.ProviderLine:     pl.Line,
+		models.ProviderFacebook:  pl.Facebook,
+		models.ProviderInstagram: pl.Instagram,
+		models.ProviderLine:      pl.Line,
 	}
 	return c.JSON(channelsResponse{Connections: views, Limits: limits, Used: used})
 }
@@ -468,3 +473,170 @@ func tenantPlan(ctx context.Context, m *db.Mongo, tid string) string {
 }
 
 func itoa(i int) string { return strconv.Itoa(i) }
+
+// ── Instagram OAuth flow ───────────────────────────────────────────────
+
+// POST /api/v1/channels/instagram/oauth/start
+//
+// Same pattern as FacebookOAuthStart — generates a state token and returns
+// the Meta Login URL (with Instagram-specific scopes). The browser is
+// redirected to Meta; after the user authorizes, Meta calls our callback at
+// /webhooks/instagram/oauth/callback, which discovers the user's Instagram
+// Business Accounts and bounces the browser back here.
+func (h *ChannelsHandler) InstagramOAuthStart(c *fiber.Ctx) error {
+	if h.cfg.FBAppID == "" || h.cfg.FBAppSecret == "" {
+		return fiber.NewError(
+			fiber.StatusFailedDependency,
+			"Instagram Login is not configured on this server (set FB_APP_ID / FB_APP_SECRET)",
+		)
+	}
+	tid := middleware.TenantID(c)
+	uid := middleware.UserID(c)
+
+	state := newUUID()
+	st := &models.InstagramOAuthState{
+		State:    state,
+		TenantID: tid,
+		UserID:   uid,
+	}
+	if err := h.store.SaveIGOAuthState(c.Context(), st); err != nil {
+		return err
+	}
+	return c.JSON(fiber.Map{
+		"login_url": channels.InstagramLoginURL(h.cfg, state),
+		"state":     state,
+	})
+}
+
+// GET /api/v1/channels/instagram/oauth/accounts?state=...
+//
+// Returns the list of Instagram Business Accounts the user can connect —
+// without their access tokens (those stay server-side, indexed by state).
+func (h *ChannelsHandler) InstagramOAuthAccounts(c *fiber.Ctx) error {
+	tid := middleware.TenantID(c)
+	uid := middleware.UserID(c)
+	state := c.Query("state")
+	if state == "" {
+		return fiber.NewError(fiber.StatusBadRequest, "missing state")
+	}
+
+	st, err := h.store.GetIGOAuthState(c.Context(), state)
+	if err != nil {
+		return err
+	}
+	if st == nil {
+		return fiber.NewError(fiber.StatusGone, "OAuth state expired")
+	}
+	if st.TenantID != tid || st.UserID != uid {
+		return fiber.NewError(fiber.StatusForbidden, "this OAuth state belongs to another user")
+	}
+
+	type accountView struct {
+		IGID     string `json:"igid"`
+		Name     string `json:"name"`
+		Username string `json:"username,omitempty"`
+	}
+	out := make([]accountView, 0, len(st.Accounts))
+	for _, a := range st.Accounts {
+		out = append(out, accountView{IGID: a.IGID, Name: a.Name, Username: a.Username})
+	}
+	return c.JSON(fiber.Map{
+		"accounts": out,
+		"state":    state,
+	})
+}
+
+// POST /api/v1/channels/instagram/oauth/connect
+//
+// User picked which Instagram Business Accounts to connect; persist them.
+type igConnectReq struct {
+	State   string   `json:"state"`
+	IGIDs   []string `json:"ig_ids"`
+}
+
+func (h *ChannelsHandler) InstagramOAuthConnect(c *fiber.Ctx) error {
+	tid := middleware.TenantID(c)
+	uid := middleware.UserID(c)
+
+	var req igConnectReq
+	if err := c.BodyParser(&req); err != nil || req.State == "" || len(req.IGIDs) == 0 {
+		return fiber.NewError(fiber.StatusBadRequest, "state and ig_ids required")
+	}
+
+	st, err := h.store.GetIGOAuthState(c.Context(), req.State)
+	if err != nil {
+		return err
+	}
+	if st == nil {
+		return fiber.NewError(fiber.StatusGone, "OAuth state expired")
+	}
+	if st.TenantID != tid || st.UserID != uid {
+		return fiber.NewError(fiber.StatusForbidden, "this OAuth state belongs to another user")
+	}
+
+	// Index discovered accounts by IGID for quick lookup.
+	byID := map[string]models.InstagramOAuthAccount{}
+	for _, a := range st.Accounts {
+		byID[a.IGID] = a
+	}
+
+	// Pre-flight plan limit check.
+	plan := tenantPlan(c.Context(), h.mongo, tid)
+	limit := channels.LimitForCtx(c.Context(), h.mongo.DB, plan, models.ProviderInstagram)
+	used, err := h.store.CountByProvider(c.Context(), tid, models.ProviderInstagram)
+	if err != nil {
+		return err
+	}
+	if limit >= 0 && int(used)+len(req.IGIDs) > limit {
+		return fiber.NewError(
+			fiber.StatusForbidden,
+			"this plan allows up to "+itoa(limit)+" Instagram accounts",
+		)
+	}
+
+	connected := []connectionView{}
+	for _, igid := range req.IGIDs {
+		acct, ok := byID[igid]
+		if !ok {
+			return fiber.NewError(fiber.StatusBadRequest, "account "+igid+" not in this OAuth session")
+		}
+		displayName := acct.Name
+		if acct.Username != "" {
+			displayName = "@" + acct.Username
+		}
+		conn := &models.ChannelConnection{
+			TenantID:    tid,
+			Provider:    models.ProviderInstagram,
+			ExternalID:  acct.IGID,
+			DisplayName: displayName,
+			Credentials: map[string]string{
+				"page_access_token": acct.PageAccessToken,
+				"ig_user_id":        acct.IGID,
+				"page_id":           acct.PageID,
+			},
+			Status:    models.ChannelStatusActive,
+			CreatedBy: uid,
+		}
+		if err := h.store.Upsert(c.Context(), conn); err != nil {
+			if errors.Is(err, channels.ErrConnectionTaken) {
+				return fiber.NewError(fiber.StatusConflict,
+					"\""+displayName+"\" is already connected to another workspace")
+			}
+			return err
+		}
+		// Subscribe to Instagram DM webhooks. Best-effort.
+		if err := channels.InstagramSubscribeAccount(c.Context(), acct.PageAccessToken, acct.IGID); err != nil {
+			_ = h.store.MarkError(c.Context(), conn.ID, "subscribe failed: "+err.Error())
+		}
+		connected = append(connected, h.toView(conn))
+	}
+
+	_ = h.store.DeleteIGOAuthState(c.Context(), req.State)
+	return c.JSON(fiber.Map{"connections": connected})
+}
+
+// newUUID generates a random UUID string. Wraps uuid.NewString so callers
+// don't need to import the uuid package.
+func newUUID() string {
+	return uuid.NewString()
+}

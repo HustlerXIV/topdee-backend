@@ -5,8 +5,9 @@ import "time"
 // Provider names — kept as constants so route handlers, the registry, and
 // stored documents all spell them the same way.
 const (
-	ProviderFacebook = "facebook"
-	ProviderLine     = "line"
+	ProviderFacebook  = "facebook"
+	ProviderInstagram = "instagram"
+	ProviderLine      = "line"
 )
 
 // ChannelConnection statuses.
@@ -77,4 +78,32 @@ type FacebookOAuthPage struct {
 	Name        string `bson:"name" json:"name"`
 	Category    string `bson:"category,omitempty" json:"category,omitempty"`
 	AccessToken string `bson:"access_token" json:"-"`
+}
+
+// InstagramOAuthState — mirrors FacebookOAuthState but for Instagram Business
+// accounts. Uses the same Meta OAuth dance (same app, same FB_APP_ID /
+// FB_APP_SECRET) with additional instagram_manage_messages scope. After the
+// callback we list the Instagram Business accounts linked to the user's pages
+// and let the user pick which to connect.
+type InstagramOAuthState struct {
+	State           string                   `bson:"_id" json:"state"`
+	TenantID        string                   `bson:"tenant_id" json:"tenant_id"`
+	UserID          string                   `bson:"user_id" json:"user_id"`
+	UserAccessToken string                   `bson:"user_access_token" json:"-"`
+	Accounts        []InstagramOAuthAccount  `bson:"accounts" json:"accounts"`
+	CreatedAt       time.Time                `bson:"created_at" json:"created_at"`
+	ExpiresAt       time.Time                `bson:"expires_at" json:"expires_at"`
+}
+
+// InstagramOAuthAccount — one Instagram Business account linked to a Facebook
+// page. PageAccessToken is server-only; it's used to send replies via the
+// Instagram Messaging API.
+type InstagramOAuthAccount struct {
+	// IGID is the Instagram Business Account ID (used as external_id and as
+	// the send endpoint: POST /{IGID}/messages).
+	IGID            string `bson:"igid" json:"igid"`
+	Name            string `bson:"name" json:"name"`
+	Username        string `bson:"username,omitempty" json:"username,omitempty"`
+	PageID          string `bson:"page_id" json:"page_id"`
+	PageAccessToken string `bson:"page_access_token" json:"-"`
 }

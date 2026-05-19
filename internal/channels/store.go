@@ -285,3 +285,50 @@ func (s *Store) UpsertProfile(ctx context.Context, p *models.CustomerProfile) er
 	)
 	return err
 }
+
+// ── Instagram OAuth state helpers ───────────────────────────────────────
+//
+// Stored in a separate collection ("channel_ig_oauth_states") to avoid
+// type conflicts with the Facebook OAuth state documents.
+
+const igOAuthStatesColl = "channel_ig_oauth_states"
+
+// SaveIGOAuthState persists an in-flight Instagram OAuth handshake.
+func (s *Store) SaveIGOAuthState(ctx context.Context, st *models.InstagramOAuthState) error {
+	if st.CreatedAt.IsZero() {
+		st.CreatedAt = time.Now().UTC()
+	}
+	if st.ExpiresAt.IsZero() {
+		st.ExpiresAt = time.Now().Add(15 * time.Minute).UTC()
+	}
+	_, err := s.mongo.DB.Collection(igOAuthStatesColl).UpdateOne(
+		ctx,
+		bson.M{"_id": st.State},
+		bson.M{"$set": st},
+		options.Update().SetUpsert(true),
+	)
+	return err
+}
+
+// GetIGOAuthState fetches a pending Instagram OAuth handshake.
+// Returns nil when missing or expired.
+func (s *Store) GetIGOAuthState(ctx context.Context, state string) (*models.InstagramOAuthState, error) {
+	var st models.InstagramOAuthState
+	err := s.mongo.DB.Collection(igOAuthStatesColl).FindOne(ctx, bson.M{"_id": state}).Decode(&st)
+	if err == mongo.ErrNoDocuments {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if !st.ExpiresAt.IsZero() && time.Now().After(st.ExpiresAt) {
+		return nil, nil
+	}
+	return &st, nil
+}
+
+// DeleteIGOAuthState removes the state record after use.
+func (s *Store) DeleteIGOAuthState(ctx context.Context, state string) error {
+	_, err := s.mongo.DB.Collection(igOAuthStatesColl).DeleteOne(ctx, bson.M{"_id": state})
+	return err
+}

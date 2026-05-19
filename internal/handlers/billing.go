@@ -885,7 +885,7 @@ func ensureReferralCoupon(discountPercent, durationMonths int) (string, error) {
 	cp := &stripe.CouponParams{
 		ID:         stripe.String(couponID),
 		PercentOff: stripe.Float64(float64(discountPercent)),
-		Duration:   &dur,
+		Duration:   stripe.String(string(dur)),
 		Name:       stripe.String(fmt.Sprintf("Referral signup discount — %d%% off", discountPercent)),
 	}
 	if durationMonths > 0 {

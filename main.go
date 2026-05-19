@@ -53,6 +53,7 @@ func main() {
 	// `registry.Register(NewFooProvider())` line.
 	channelRegistry := channels.NewRegistry()
 	channelRegistry.Register(channels.NewFacebookProvider())
+	channelRegistry.Register(channels.NewInstagramProvider())
 	channelRegistry.Register(channels.NewLineProvider())
 	channelStore := channels.NewStore(mongo)
 
@@ -189,6 +190,10 @@ func main() {
 	protected.Post("/channels/facebook/oauth/start", chH.FacebookOAuthStart)
 	protected.Get("/channels/facebook/oauth/pages", chH.FacebookOAuthPages)
 	protected.Post("/channels/facebook/oauth/connect", chH.FacebookOAuthConnect)
+	// Instagram: OAuth login flow → account picker → connect selected IG Business Accounts.
+	protected.Post("/channels/instagram/oauth/start", chH.InstagramOAuthStart)
+	protected.Get("/channels/instagram/oauth/accounts", chH.InstagramOAuthAccounts)
+	protected.Post("/channels/instagram/oauth/connect", chH.InstagramOAuthConnect)
 
 	// Analytics — real stats from the messages collection.
 	analyticsH := handlers.NewAnalyticsHandler(mongo)
@@ -213,6 +218,22 @@ func main() {
 	protected.Post("/inbox/conversations/:id/images", inboxH.SendImage)
 	protected.Patch("/inbox/conversations/:id/resolve", inboxH.ResolveHandoff)
 
+	// Referral programme — user-facing.
+	referralH := handlers.NewReferralHandler(mongo)
+	protected.Get("/referral/code", referralH.GetCode)
+	protected.Get("/referral", referralH.GetStats)
+	protected.Get("/referral/wallet", referralH.GetWallet)
+	protected.Post("/referral/wallet/payout", referralH.RequestPayout)
+
+	// Referral programme — platform admin.
+	adminReferralH := handlers.NewAdminReferralHandler(mongo)
+	protected.Get("/admin/referral/settings", middleware.RequireAdmin(), adminReferralH.GetSettings)
+	protected.Put("/admin/referral/settings", middleware.RequireAdmin(), adminReferralH.UpdateSettings)
+	protected.Get("/admin/referral/referrals", middleware.RequireAdmin(), adminReferralH.ListReferrals)
+	protected.Get("/admin/referral/wallets", middleware.RequireAdmin(), adminReferralH.ListWallets)
+	protected.Post("/admin/referral/wallets/:id/payout", middleware.RequireAdmin(), adminReferralH.MarkPayoutDone)
+	protected.Patch("/admin/referral/wallets/:id", middleware.RequireAdmin(), adminReferralH.UpdateWalletPayoutType)
+
 	// Stripe billing — tenant-scoped self-service.
 	billingH := handlers.NewBillingHandler(mongo, cfg)
 	protected.Get("/billing", billingH.GetInfo)
@@ -232,6 +253,7 @@ func main() {
 	// routes since they don't fit the per-provider Provider interface.
 	webhooks := app.Group("/webhooks")
 	webhooks.Get("/facebook/oauth/callback", handlers.FacebookOAuthCallback(channelStore, mongo, cfg))
+	webhooks.Get("/instagram/oauth/callback", handlers.InstagramOAuthCallback(channelStore, mongo, cfg))
 	webhooks.Post("/stripe", handlers.StripeWebhook(mongo, cfg))
 	// Generic provider webhooks. Two URL shapes are supported:
 	//   /webhooks/<provider>                 — uses the body to find the

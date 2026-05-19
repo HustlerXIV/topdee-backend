@@ -319,6 +319,62 @@ func firstNonEmpty(a, b string) string {
 	return b
 }
 
+// ── Instagram OAuth callback ────────────────────────────────────────────
+//
+// Mirrors FacebookOAuthCallback. After Meta redirects back here, we exchange
+// the code for a long-lived user token, discover all linked Instagram Business
+// Accounts, store them on the state record, and bounce the browser to the
+// dashboard account picker.
+
+func InstagramOAuthCallback(store *channels.Store, m *db.Mongo, cfg *config.Config) fiber.Handler {
+	return func(c *fiber.Ctx) error {
+		state := c.Query("state")
+		code := c.Query("code")
+		errMsg := c.Query("error_description")
+
+		if state == "" {
+			return fiber.NewError(fiber.StatusBadRequest, "missing state")
+		}
+
+		st, err := store.GetIGOAuthState(c.Context(), state)
+		if err != nil {
+			return err
+		}
+		if st == nil {
+			return fiber.NewError(fiber.StatusBadRequest, "invalid or expired state")
+		}
+
+		if code == "" {
+			_ = store.DeleteIGOAuthState(c.Context(), state)
+			redirectTo := cfg.FrontendBaseURL + "/channels?ig_oauth=error&reason=" +
+				url.QueryEscape(firstNonEmpty(errMsg, "no code returned"))
+			return c.Redirect(redirectTo, fiber.StatusFound)
+		}
+
+		userToken, err := channels.InstagramExchangeCode(c.Context(), cfg, code)
+		if err != nil {
+			log.Printf("ig oauth: exchange: %v", err)
+			_ = store.DeleteIGOAuthState(c.Context(), state)
+			return c.Redirect(cfg.FrontendBaseURL+"/channels?ig_oauth=error&reason=exchange_failed", fiber.StatusFound)
+		}
+
+		accounts, err := channels.InstagramListAccounts(c.Context(), userToken)
+		if err != nil {
+			log.Printf("ig oauth: list accounts: %v", err)
+			_ = store.DeleteIGOAuthState(c.Context(), state)
+			return c.Redirect(cfg.FrontendBaseURL+"/channels?ig_oauth=error&reason=list_accounts_failed", fiber.StatusFound)
+		}
+
+		st.UserAccessToken = userToken
+		st.Accounts = accounts
+		if err := store.SaveIGOAuthState(c.Context(), st); err != nil {
+			log.Printf("ig oauth: save state: %v", err)
+		}
+
+		return c.Redirect(cfg.FrontendBaseURL+"/channels?ig_oauth=ok&state="+url.QueryEscape(state), fiber.StatusFound)
+	}
+}
+
 // cacheCustomerProfile fetches a customer's display name from the platform
 // (LINE only for now — Meta tightly restricts profile access on Messenger
 // and most page-scoped IDs return nothing useful) and caches it. Idempotent;

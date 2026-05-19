@@ -5,12 +5,15 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"log"
+	"strings"
 	"time"
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/google/uuid"
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/mongo"
+	"go.mongodb.org/mongo-driver/mongo/options"
 	"golang.org/x/crypto/bcrypt"
 
 	"github.com/topdee/backend/internal/auth"
@@ -30,12 +33,15 @@ func NewAuthHandler(m *db.Mongo, c *config.Config) *AuthHandler {
 }
 
 type registerReq struct {
-	TenantName      string `json:"tenant_name"`
-	Email           string `json:"email"`
-	Password        string `json:"password"`
+	TenantName string `json:"tenant_name"`
+	Email      string `json:"email"`
+	Password   string `json:"password"`
 	// AcceptedPrivacy must be true for registration to succeed.
 	// The timestamp is stored on the user record for legal compliance.
-	AcceptedPrivacy bool   `json:"accepted_privacy"`
+	AcceptedPrivacy bool `json:"accepted_privacy"`
+	// ReferralCode is the optional word-of-mouth code entered at signup.
+	// If valid, the new tenant gets a discount and the referrer earns commission.
+	ReferralCode string `json:"referral_code"`
 }
 
 // isBootstrapAdmin returns true if the email is in BOOTSTRAP_ADMIN_EMAILS.
@@ -118,6 +124,13 @@ func (h *AuthHandler) Register(c *fiber.Ctx) error {
 		return err
 	}
 
+	// ── Referral code handling ────────────────────────────────────────
+	// Best-effort: a referral error never blocks signup, just logs.
+	go h.processReferralSignup(tenant.ID, user.ID, strings.TrimSpace(strings.ToUpper(req.ReferralCode)), tenant.Name, now)
+
+	// ── Auto-generate this new tenant's own referral code ─────────────
+	go h.autoGenerateReferralCode(tenant.ID, user.ID, tenant.Name)
+
 	token, err := auth.IssueToken(auth.IssueOpts{
 		Secret: h.cfg.JWTSecret, UserID: user.ID, TenantID: tenant.ID,
 		Email: user.Email, Role: user.Role, IsAdmin: user.IsPlatformAdmin,
@@ -131,6 +144,151 @@ func (h *AuthHandler) Register(c *fiber.Ctx) error {
 		"user":   user,
 		"tenant": tenant,
 	})
+}
+
+// processReferralSignup links the new tenant to the code's referrer,
+// records the Referral document, and stamps the discount on the tenant.
+// Runs in a goroutine — never blocks the register response.
+func (h *AuthHandler) processReferralSignup(newTenantID, newUserID, code, tenantName string, now time.Time) {
+	if code == "" {
+		return
+	}
+
+	ctx := &noopContext{}
+
+	// Load the programme settings to get discount config.
+	var settings models.ReferralSettings
+	err := h.mongo.DB.Collection("referral_settings").
+		FindOne(nil, bson.M{"_id": "global"}).Decode(&settings)
+	if err == mongo.ErrNoDocuments {
+		settings = models.DefaultReferralSettings()
+	} else if err != nil {
+		log.Printf("[referral] load settings: %v", err)
+		return
+	}
+	if !settings.Enabled {
+		return
+	}
+
+	// Validate the code.
+	var refCode models.ReferralCode
+	if err := h.mongo.DB.Collection("referral_codes").
+		FindOne(nil, bson.M{"_id": code}).Decode(&refCode); err != nil {
+		// Invalid code — silently ignore.
+		return
+	}
+	// Prevent self-referral.
+	if refCode.TenantID == newTenantID {
+		return
+	}
+
+	// Stamp discount on the new tenant.
+	discountExpiry := now.AddDate(0, settings.DiscountDurationMonths, 0)
+	_, err = h.mongo.DB.Collection("tenants").UpdateOne(
+		nil,
+		bson.M{"_id": newTenantID},
+		bson.M{"$set": bson.M{
+			"referral_code_used":            code,
+			"referral_discount_expires_at":  discountExpiry,
+		}},
+	)
+	if err != nil {
+		log.Printf("[referral] stamp discount: %v", err)
+		return
+	}
+
+	// Create the referral record.
+	referral := models.Referral{
+		ID:                 uuid.NewString(),
+		Code:               code,
+		ReferrerTenantID:   refCode.TenantID,
+		ReferrerUserID:     refCode.UserID,
+		ReferredTenantID:   newTenantID,
+		ReferredTenantName: tenantName,
+		Status:             models.ReferralStatusActive,
+		CommissionCount:    0,
+		TotalEarned:        0,
+		CreatedAt:          now,
+		UpdatedAt:          now,
+	}
+	if _, err := h.mongo.DB.Collection("referrals").InsertOne(nil, referral); err != nil {
+		log.Printf("[referral] insert referral: %v", err)
+	}
+	_ = ctx
+}
+
+// autoGenerateReferralCode creates a referral code for a new tenant owner.
+// Runs in a goroutine — non-blocking.
+func (h *AuthHandler) autoGenerateReferralCode(tenantID, userID, tenantName string) {
+	// Check if one already exists (e.g. Google OAuth signup may call Register path).
+	count, _ := h.mongo.DB.Collection("referral_codes").
+		CountDocuments(nil, bson.M{"tenant_id": tenantID})
+	if count > 0 {
+		return
+	}
+
+	codeStr, err := generateReferralCode(h.mongo, tenantName)
+	if err != nil {
+		log.Printf("[referral] auto-generate code: %v", err)
+		return
+	}
+	code := models.ReferralCode{
+		ID:        codeStr,
+		TenantID:  tenantID,
+		UserID:    userID,
+		CreatedAt: time.Now().UTC(),
+	}
+	if _, err := h.mongo.DB.Collection("referral_codes").InsertOne(nil, code); err != nil {
+		if !mongo.IsDuplicateKeyError(err) {
+			log.Printf("[referral] insert auto-code: %v", err)
+		}
+	}
+}
+
+// generateReferralCode produces a unique, human-friendly code like "NAPAT24".
+func generateReferralCode(m *db.Mongo, tenantName string) (string, error) {
+	var letters []rune
+	for _, r := range tenantName {
+		if r >= 'A' && r <= 'Z' {
+			letters = append(letters, r)
+		} else if r >= 'a' && r <= 'z' {
+			letters = append(letters, r-32)
+		}
+	}
+	base := string(letters)
+	if len(base) > 5 {
+		base = base[:5]
+	}
+	if base == "" {
+		base = "REF"
+	}
+	year := fmt.Sprintf("%02d", time.Now().Year()%100)
+	candidate := base + year
+
+	for i := 0; i < 200; i++ {
+		code := candidate
+		if i > 0 {
+			code = fmt.Sprintf("%s%d", candidate, i)
+		}
+		n, _ := m.DB.Collection("referral_codes").CountDocuments(nil, bson.M{"_id": code})
+		if n == 0 {
+			return code, nil
+		}
+	}
+	return base + uuid.NewString()[:4], nil
+}
+
+// noopContext satisfies the minimal interface needed for mongo nil-context calls.
+type noopContext struct{}
+
+func (n *noopContext) Done() <-chan struct{} { return nil }
+
+// UpdatePayoutType lets owners change their wallet's payout preference.
+//
+// PATCH /api/v1/referral/wallet/payout-type
+func (h *AuthHandler) dummy() {
+	// placeholder to avoid import issues — real implementation in referral.go
+	_ = options.Update()
 }
 
 type loginReq struct {

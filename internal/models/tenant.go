@@ -112,8 +112,15 @@ type Tenant struct {
 	// QuotaWarnMonth tracks when we last sent the 80% usage warning, stored as
 	// "YYYY-MM" (e.g. "2026-05"). We skip sending if it matches the current
 	// month so owners only get one email per billing cycle.
-	QuotaWarnMonth string    `bson:"quota_warn_month,omitempty" json:"-"`
-	CreatedAt      time.Time `bson:"created_at" json:"created_at"`
+	QuotaWarnMonth string `bson:"quota_warn_month,omitempty" json:"-"`
+	// Referral — set at signup when the tenant used a referral code.
+	// ReferralCodeUsed is the code that was entered; used to look up the
+	// referrer when the first invoice is paid.
+	ReferralCodeUsed string `bson:"referral_code_used,omitempty" json:"referral_code_used,omitempty"`
+	// ReferralDiscountExpiresAt is when the signup discount (e.g. 10% off)
+	// stops being applied at Stripe Checkout. Nil = no discount.
+	ReferralDiscountExpiresAt *time.Time `bson:"referral_discount_expires_at,omitempty" json:"referral_discount_expires_at,omitempty"`
+	CreatedAt                 time.Time  `bson:"created_at" json:"created_at"`
 }
 
 // NotificationPrefs stores which email alerts a user has opted into.

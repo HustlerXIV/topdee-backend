@@ -21,6 +21,7 @@ package handlers
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log"
 	"time"
@@ -313,7 +314,7 @@ func handleSubscriptionDeleted(ctx context.Context, mongo *db.Mongo, ev stripe.E
 	return err
 }
 
-func handleInvoicePaid(ctx context.Context, mongo *db.Mongo, ev stripe.Event) error {
+func handleInvoicePaid(ctx context.Context, m *db.Mongo, ev stripe.Event) error {
 	var inv stripe.Invoice
 	if err := json.Unmarshal(ev.Data.Raw, &inv); err != nil {
 		return err
@@ -321,7 +322,7 @@ func handleInvoicePaid(ctx context.Context, mongo *db.Mongo, ev stripe.Event) er
 	if inv.Customer == nil || inv.Subscription == nil {
 		return nil
 	}
-	t, err := findTenantByCustomer(ctx, mongo, inv.Customer.ID)
+	t, err := findTenantByCustomer(ctx, m, inv.Customer.ID)
 	if err != nil || t == nil {
 		return err
 	}
@@ -336,11 +337,77 @@ func handleInvoicePaid(ctx context.Context, mongo *db.Mongo, ev stripe.Event) er
 	}
 	merged.UpdatedAt = time.Now().UTC()
 
-	_, err = mongo.DB.Collection("tenants").UpdateOne(ctx,
+	_, err = m.DB.Collection("tenants").UpdateOne(ctx,
 		bson.M{"_id": t.ID},
 		bson.M{"$set": bson.M{"subscription": merged}},
 	)
-	return err
+	if err != nil {
+		return err
+	}
+
+	// ── Referral commission ───────────────────────────────────────────
+	// Fire-and-forget: a commission error must never fail the webhook
+	// (Stripe would retry, causing duplicate subscription updates).
+	go creditReferralCommission(m, t)
+
+	return nil
+}
+
+// creditReferralCommission finds the active referral for this tenant and
+// credits the appropriate commission to the referrer's wallet.
+func creditReferralCommission(m *db.Mongo, t *models.Tenant) {
+	if t.ReferralCodeUsed == "" {
+		return
+	}
+
+	// Load programme settings.
+	var settings models.ReferralSettings
+	if err := m.DB.Collection("referral_settings").
+		FindOne(nil, bson.M{"_id": "global"}).Decode(&settings); err != nil {
+		settings = models.DefaultReferralSettings()
+	}
+	if !settings.Enabled {
+		return
+	}
+
+	// Find the referral record for this referred tenant.
+	var referral models.Referral
+	if err := m.DB.Collection("referrals").
+		FindOne(nil, bson.M{
+			"referred_tenant_id": t.ID,
+			"status":             models.ReferralStatusActive,
+		}).Decode(&referral); err != nil {
+		return // no active referral — nothing to credit
+	}
+
+	// Determine commission amount.
+	amount := settings.RecurringCommissionAmount
+	if referral.CommissionCount == 0 {
+		amount = settings.FirstCommissionAmount
+	}
+	if amount <= 0 {
+		return
+	}
+
+	now := time.Now().UTC()
+	description := fmt.Sprintf("Referral commission from %s — ฿%.2f",
+		referral.ReferredTenantName, float64(amount)/100)
+
+	// Credit the wallet.
+	if err := CreditCommission(nil, m, referral.ReferrerTenantID, referral.ID, description, amount); err != nil {
+		log.Printf("[referral] credit commission: %v", err)
+		return
+	}
+
+	// Update the referral record.
+	_, err := m.DB.Collection("referrals").UpdateOne(nil,
+		bson.M{"_id": referral.ID},
+		bson.M{"$inc": bson.M{"commission_count": 1, "total_earned": amount},
+			"$set": bson.M{"updated_at": now}},
+	)
+	if err != nil {
+		log.Printf("[referral] update referral stats: %v", err)
+	}
 }
 
 func handleInvoiceFailed(ctx context.Context, mongo *db.Mongo, ev stripe.Event) error {

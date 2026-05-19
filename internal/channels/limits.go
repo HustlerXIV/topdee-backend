@@ -10,8 +10,9 @@ import (
 
 // PlanLimit is kept for backward-compat with callers that use LimitsForPlan.
 type PlanLimit struct {
-	Facebook int
-	Line     int
+	Facebook  int
+	Instagram int
+	Line      int
 }
 
 // planDoc is a minimal projection of the plans collection used by LimitForCtx.
@@ -72,6 +73,8 @@ func limitFallback(plan, provider string) int {
 	switch provider {
 	case "facebook":
 		return pl.Facebook
+	case "instagram":
+		return pl.Instagram
 	case "line":
 		return pl.Line
 	}
@@ -81,13 +84,13 @@ func limitFallback(plan, provider string) int {
 // hardcodedLimits are bootstrap values used before the plans collection is
 // seeded, and as the ultimate fallback.
 var hardcodedLimits = map[string]PlanLimit{
-	"free":       {Facebook: 1, Line: 1},
-	"starter":    {Facebook: 1, Line: 1},
-	"basic":      {Facebook: 3, Line: 1},
-	"growth":     {Facebook: 5, Line: 3},
-	"pro":        {Facebook: 10, Line: 5},
-	"enterprise": {Facebook: 100, Line: 100},
-	"default":    {Facebook: 1, Line: 1},
+	"free":       {Facebook: 1, Instagram: 1, Line: 1},
+	"starter":    {Facebook: 1, Instagram: 1, Line: 1},
+	"basic":      {Facebook: 3, Instagram: 3, Line: 1},
+	"growth":     {Facebook: 5, Instagram: 5, Line: 3},
+	"pro":        {Facebook: 10, Instagram: 10, Line: 5},
+	"enterprise": {Facebook: 100, Instagram: 100, Line: 100},
+	"default":    {Facebook: 1, Instagram: 1, Line: 1},
 }
 
 // LimitsForPlan returns the full hardcoded table for one plan.

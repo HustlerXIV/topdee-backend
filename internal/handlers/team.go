@@ -202,14 +202,26 @@ func (h *TeamHandler) CreateInvite(c *fiber.Ctx) error {
 		return fiber.NewError(fiber.StatusBadRequest, "role must be admin, agent, or viewer")
 	}
 
-	// Reject if a user with that email already exists in this tenant.
+	// Reject if a user with that email already exists anywhere in the platform.
+	// We check globally (not just this tenant) because the accept-invite flow
+	// creates a brand-new user document — if the email is already taken the
+	// insert will fail with a duplicate-key error and the recipient will see a
+	// confusing dead end.  Catching it here gives the inviter a clear message
+	// before the email is even sent.
 	count, err := h.mongo.DB.Collection("users").CountDocuments(c.Context(),
-		bson.M{"tenant_id": tid, "email": req.Email})
+		bson.M{"email": req.Email})
 	if err != nil {
 		return err
 	}
 	if count > 0 {
-		return fiber.NewError(fiber.StatusConflict, "this email already belongs to a member")
+		// Check if they're already in THIS workspace.
+		inTenant, _ := h.mongo.DB.Collection("users").CountDocuments(c.Context(),
+			bson.M{"tenant_id": tid, "email": req.Email})
+		if inTenant > 0 {
+			return fiber.NewError(fiber.StatusConflict, "this email already belongs to a member of this workspace")
+		}
+		return fiber.NewError(fiber.StatusConflict,
+			"this email already has a Topdee account on another workspace — multi-workspace support is coming soon")
 	}
 
 	// Look up workspace name for the email subject + body.
@@ -456,7 +468,8 @@ func (h *TeamHandler) AcceptInvite(c *fiber.Ctx) error {
 	}
 	if _, err := h.mongo.DB.Collection("users").InsertOne(c.Context(), user); err != nil {
 		if mongo.IsDuplicateKeyError(err) {
-			return fiber.NewError(fiber.StatusConflict, "an account with this email already exists")
+			return fiber.NewError(fiber.StatusConflict,
+				"this email already has a Topdee account — multi-workspace support is coming soon; ask your workspace owner to contact support")
 		}
 		return err
 	}

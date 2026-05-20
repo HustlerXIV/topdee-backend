@@ -666,9 +666,13 @@ func (h *BillingHandler) SyncCheckoutSession(c *fiber.Ctx) error {
 		if planSlug != "" {
 			updates["plan"] = planSlug
 		}
+		syncUpdate := bson.M{"$set": updates}
+		if existing.ReferralDiscountType == models.DiscountTypeFirstPurchase || existing.ReferralDiscountType == "" {
+			syncUpdate["$unset"] = bson.M{"referral_discount_expires_at": ""}
+		}
 		_, _ = h.mongo.DB.Collection("tenants").UpdateOne(ctx,
 			bson.M{"_id": tid},
-			bson.M{"$set": updates},
+			syncUpdate,
 		)
 
 		// ── Upsert Payment record (idempotent: session ID is _id) ────────────────
@@ -997,11 +1001,21 @@ func (h *BillingHandler) GetInfo(c *fiber.Ctx) error {
 		},
 	}
 
-	// Include referral discount info when still active.
+	// Include referral discount when still active.
+	// first_purchase: only show while on the free plan (cleared by webhook on payment).
+	// duration:       show until expiry regardless of plan (applies to renewals too).
 	if t.ReferralDiscountExpiresAt != nil && time.Now().UTC().Before(*t.ReferralDiscountExpiresAt) {
-		if settings, serr := loadReferralSettings(h.mongo, ctx); serr == nil && settings.DiscountPercent > 0 {
-			resp.ReferralDiscountPercent = settings.DiscountPercent
-			resp.ReferralDiscountExpiresAt = t.ReferralDiscountExpiresAt
+		discountType := t.ReferralDiscountType
+		if discountType == "" {
+			discountType = models.DiscountTypeFirstPurchase // safe default
+		}
+		onFreePlan := t.Plan == "" || t.Plan == "free"
+		show := discountType == models.DiscountTypeDuration || onFreePlan
+		if show {
+			if settings, serr := loadReferralSettings(h.mongo, ctx); serr == nil && settings.DiscountPercent > 0 {
+				resp.ReferralDiscountPercent = settings.DiscountPercent
+				resp.ReferralDiscountExpiresAt = t.ReferralDiscountExpiresAt
+			}
 		}
 	}
 

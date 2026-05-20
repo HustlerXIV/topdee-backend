@@ -8,6 +8,7 @@ package handlers
 //   POST /api/v1/referral/wallet/payout  → request payout or apply as bill credit
 
 import (
+	"context"
 	"fmt"
 	"regexp"
 	"strings"
@@ -355,14 +356,12 @@ func generateUniqueCode(ctx interface{ Done() <-chan struct{} }, m *db.Mongo, te
 // CreditCommission credits a commission to a referrer's wallet when a referred
 // tenant's invoice is paid. Called from the Stripe webhook handler.
 // Safe to call concurrently — uses MongoDB $inc for atomicity.
-func CreditCommission(ctx interface {
-	Done() <-chan struct{}
-}, m *db.Mongo, referrerTenantID, referralID, description string, amount int) error {
+func CreditCommission(ctx context.Context, m *db.Mongo, referrerTenantID, referralID, description string, amount int) error {
 	now := time.Now().UTC()
 
 	// Upsert wallet — create with this amount if it doesn't exist yet.
 	_, err := m.DB.Collection("wallets").UpdateOne(
-		nil,
+		ctx,
 		bson.M{"_id": referrerTenantID},
 		bson.M{
 			"$inc": bson.M{"balance": amount},
@@ -386,6 +385,6 @@ func CreditCommission(ctx interface {
 		Description: description,
 		CreatedAt:   now,
 	}
-	_, err = m.DB.Collection("wallet_transactions").InsertOne(nil, txn)
+	_, err = m.DB.Collection("wallet_transactions").InsertOne(ctx, txn)
 	return err
 }

@@ -13,6 +13,7 @@ const (
 	ChannelDashboard = "dashboard"
 	ChannelFacebook  = "facebook"
 	ChannelLine      = "line"
+	ChannelWeb       = "web"
 )
 
 // Message — one turn in a conversation. Conversations are scoped to a tenant

@@ -184,13 +184,27 @@ func (h *AuthHandler) processReferralSignup(newTenantID, newUserID, code, tenant
 	}
 
 	// Stamp discount on the new tenant.
-	discountExpiry := now.AddDate(0, settings.DiscountDurationMonths, 0)
+	// For "first_purchase" the expiry is set far in the future — the webhook
+	// clears it as soon as the first payment lands, so the date is just a
+	// safety-net fallback. For "duration" the expiry controls how long the
+	// discount is valid across renewals.
+	discountType := settings.DiscountType
+	if discountType == "" {
+		discountType = models.DiscountTypeFirstPurchase
+	}
+	var discountExpiry time.Time
+	if discountType == models.DiscountTypeDuration {
+		discountExpiry = now.AddDate(0, settings.DiscountDurationMonths, 0)
+	} else {
+		discountExpiry = now.AddDate(10, 0, 0) // first_purchase: cleared by webhook, far-future fallback
+	}
 	_, err = h.mongo.DB.Collection("tenants").UpdateOne(
 		ctx,
 		bson.M{"_id": newTenantID},
 		bson.M{"$set": bson.M{
 			"referral_code_used":           code,
 			"referral_discount_expires_at": discountExpiry,
+			"referral_discount_type":       discountType,
 		}},
 	)
 	if err != nil {

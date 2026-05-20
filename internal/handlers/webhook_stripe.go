@@ -158,9 +158,13 @@ func handleCheckoutCompleted(ctx context.Context, mongo *db.Mongo, ev stripe.Eve
 			updates["plan"] = planSlug
 			log.Printf("[stripe webhook] promptpay checkout: tenant=%s plan=%s until=%s", t.ID, planSlug, periodEnd.Format("2006-01-02"))
 		}
+		tenantUpdate := bson.M{"$set": updates}
+		if t.ReferralDiscountType == models.DiscountTypeFirstPurchase || t.ReferralDiscountType == "" {
+			tenantUpdate["$unset"] = bson.M{"referral_discount_expires_at": ""}
+		}
 		_, err = mongo.DB.Collection("tenants").UpdateOne(ctx,
 			bson.M{"_id": t.ID},
-			bson.M{"$set": updates},
+			tenantUpdate,
 		)
 		if err != nil {
 			return err
@@ -346,9 +350,13 @@ func handleInvoicePaid(ctx context.Context, m *db.Mongo, ev stripe.Event) error 
 	}
 	merged.UpdatedAt = time.Now().UTC()
 
+	invoiceUpdate := bson.M{"$set": bson.M{"subscription": merged}}
+	if t.ReferralDiscountType == models.DiscountTypeFirstPurchase || t.ReferralDiscountType == "" {
+		invoiceUpdate["$unset"] = bson.M{"referral_discount_expires_at": ""}
+	}
 	_, err = m.DB.Collection("tenants").UpdateOne(ctx,
 		bson.M{"_id": t.ID},
-		bson.M{"$set": bson.M{"subscription": merged}},
+		invoiceUpdate,
 	)
 	if err != nil {
 		return err
@@ -364,15 +372,20 @@ func handleInvoicePaid(ctx context.Context, m *db.Mongo, ev stripe.Event) error 
 
 // creditReferralCommission finds the active referral for this tenant and
 // credits the appropriate commission to the referrer's wallet.
+// Called as a goroutine — must create its own context since the request
+// context is already cancelled by the time we get here.
 func creditReferralCommission(m *db.Mongo, t *models.Tenant) {
 	if t.ReferralCodeUsed == "" {
 		return
 	}
 
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
 	// Load programme settings.
 	var settings models.ReferralSettings
 	if err := m.DB.Collection("referral_settings").
-		FindOne(nil, bson.M{"_id": "global"}).Decode(&settings); err != nil {
+		FindOne(ctx, bson.M{"_id": "global"}).Decode(&settings); err != nil {
 		settings = models.DefaultReferralSettings()
 	}
 	if !settings.Enabled {
@@ -382,7 +395,7 @@ func creditReferralCommission(m *db.Mongo, t *models.Tenant) {
 	// Find the referral record for this referred tenant.
 	var referral models.Referral
 	if err := m.DB.Collection("referrals").
-		FindOne(nil, bson.M{
+		FindOne(ctx, bson.M{
 			"referred_tenant_id": t.ID,
 			"status":             models.ReferralStatusActive,
 		}).Decode(&referral); err != nil {
@@ -403,13 +416,13 @@ func creditReferralCommission(m *db.Mongo, t *models.Tenant) {
 		referral.ReferredTenantName, float64(amount)/100)
 
 	// Credit the wallet.
-	if err := CreditCommission(nil, m, referral.ReferrerTenantID, referral.ID, description, amount); err != nil {
+	if err := CreditCommission(ctx, m, referral.ReferrerTenantID, referral.ID, description, amount); err != nil {
 		log.Printf("[referral] credit commission: %v", err)
 		return
 	}
 
 	// Update the referral record.
-	_, err := m.DB.Collection("referrals").UpdateOne(nil,
+	_, err := m.DB.Collection("referrals").UpdateOne(ctx,
 		bson.M{"_id": referral.ID},
 		bson.M{"$inc": bson.M{"commission_count": 1, "total_earned": amount},
 			"$set": bson.M{"updated_at": now}},

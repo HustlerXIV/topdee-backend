@@ -195,6 +195,17 @@ func main() {
 	protected.Get("/channels/instagram/oauth/accounts", chH.InstagramOAuthAccounts)
 	protected.Post("/channels/instagram/oauth/connect", chH.InstagramOAuthConnect)
 
+	// Web widget — creates a connection + returns the embed code.
+	protected.Post("/channels/web", chH.ConnectWeb)
+
+	// Public widget API — no JWT, authenticated by widget_id.
+	// Served under /widget/* (not /api/v1/*) so the URL is clean in embed code.
+	widgetH := handlers.NewWidgetHandler(mongo, orch)
+	widget := app.Group("/widget")
+	widget.Get("/:widget_id/config", widgetH.Config)
+	widget.Post("/:widget_id/chat", widgetH.Chat)
+	widget.Get("/:widget_id/history", widgetH.History)
+
 	// Analytics — real stats from the messages collection.
 	analyticsH := handlers.NewAnalyticsHandler(mongo)
 	protected.Get("/analytics", analyticsH.GetStats)

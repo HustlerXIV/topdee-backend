@@ -59,6 +59,24 @@ var sourceMentionPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`(?im)^\s*(?:sources?|references?|citations?|ที่มา|แหล่งที่มา|อ้างอิง)\s*[:：]\s*\n(?:[-*•]\s*.*\n?)+`),
 }
 
+// isSubscriptionLapsed returns true when a tenant's paid features should be
+// suspended because their subscription has expired, failed, or been canceled.
+//
+// Pure free-tier tenants (Subscription == nil) are NOT considered lapsed —
+// they never had paid access to begin with. Only tenants that previously had
+// an active subscription but are now in a terminal or delinquent state are
+// gated here.
+func isSubscriptionLapsed(t models.Tenant) bool {
+	if t.Subscription == nil {
+		return false
+	}
+	switch t.Subscription.Status {
+	case models.SubStatusPastDue, models.SubStatusCanceled, models.SubStatusPaused:
+		return true
+	}
+	return false
+}
+
 // stripSourceMentions removes any (source: ...) and trailing "Sources:"
 // blocks from a reply. Returns the cleaned text with leading/trailing
 // whitespace trimmed so we don't accidentally emit a message that's just
@@ -228,6 +246,16 @@ func (o *Orchestrator) HandleIncoming(
 			"💬 New message from a customer — "+tenantName,
 			email.NewChatHTML(tenantName, externalUserID, preview, channel, o.cfg.FrontendBaseURL),
 		)
+	}
+
+	// ── Subscription lapsed gate ─────────────────────────────────────────────
+	// If the tenant's subscription has expired we still save the inbound
+	// message (so the inbox stays current and human agents can still reply
+	// manually), but we do not call the AI service and return an empty reply.
+	// The dashboard playground is NOT affected here — it has its own check
+	// in PlaygroundHandler.Send so we give a proper 402 to the UI.
+	if channel != models.ChannelDashboard && isSubscriptionLapsed(tenant) {
+		return "", nil, conversationID, nil
 	}
 
 	if bot.mode == "manual" || strings.TrimSpace(message) == "" {
@@ -839,6 +867,17 @@ func (h *PlaygroundHandler) Send(c *fiber.Ctx) error {
 	}
 	if req.Message == "" {
 		return fiber.NewError(fiber.StatusBadRequest, "message required")
+	}
+
+	// Block the playground when the subscription has lapsed. We return 402
+	// (Payment Required) so the UI can show a targeted renewal prompt instead
+	// of a generic error toast.
+	var tenantDoc models.Tenant
+	if err := h.mongo.DB.Collection("tenants").
+		FindOne(c.Context(), bson.M{"_id": tid}).Decode(&tenantDoc); err == nil {
+		if isSubscriptionLapsed(tenantDoc) {
+			return fiber.NewError(fiber.StatusPaymentRequired, "subscription_expired")
+		}
 	}
 
 	reply, sources, convID, err := h.o.HandleIncoming(

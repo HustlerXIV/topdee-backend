@@ -195,6 +195,17 @@ func main() {
 	protected.Get("/channels/instagram/oauth/accounts", chH.InstagramOAuthAccounts)
 	protected.Post("/channels/instagram/oauth/connect", chH.InstagramOAuthConnect)
 
+	// Web widget — creates a connection + returns the embed code.
+	protected.Post("/channels/web", chH.ConnectWeb)
+
+	// Public widget API — no JWT, authenticated by widget_id.
+	// Served under /widget/* (not /api/v1/*) so the URL is clean in embed code.
+	widgetH := handlers.NewWidgetHandler(mongo, orch)
+	widget := app.Group("/widget")
+	widget.Get("/:widget_id/config", widgetH.Config)
+	widget.Post("/:widget_id/chat", widgetH.Chat)
+	widget.Get("/:widget_id/history", widgetH.History)
+
 	// Analytics — real stats from the messages collection.
 	analyticsH := handlers.NewAnalyticsHandler(mongo)
 	protected.Get("/analytics", analyticsH.GetStats)
@@ -223,7 +234,8 @@ func main() {
 	protected.Get("/referral/code", referralH.GetCode)
 	protected.Get("/referral", referralH.GetStats)
 	protected.Get("/referral/wallet", referralH.GetWallet)
-	protected.Post("/referral/wallet/payout", referralH.RequestPayout)
+	protected.Post("/referral/wallet/payout-request", referralH.SubmitPayoutRequest)
+	protected.Get("/referral/wallet/payout-requests", referralH.GetMyPayoutRequests)
 
 	// Referral programme — platform admin.
 	adminReferralH := handlers.NewAdminReferralHandler(mongo)
@@ -233,6 +245,9 @@ func main() {
 	protected.Get("/admin/referral/wallets", middleware.RequireAdmin(), adminReferralH.ListWallets)
 	protected.Post("/admin/referral/wallets/:id/payout", middleware.RequireAdmin(), adminReferralH.MarkPayoutDone)
 	protected.Patch("/admin/referral/wallets/:id", middleware.RequireAdmin(), adminReferralH.UpdateWalletPayoutType)
+	protected.Get("/admin/referral/payout-requests", middleware.RequireAdmin(), adminReferralH.ListPayoutRequests)
+	protected.Post("/admin/referral/payout-requests/:id/approve", middleware.RequireAdmin(), adminReferralH.ApprovePayoutRequest)
+	protected.Post("/admin/referral/payout-requests/:id/reject", middleware.RequireAdmin(), adminReferralH.RejectPayoutRequest)
 
 	// Stripe billing — tenant-scoped self-service.
 	billingH := handlers.NewBillingHandler(mongo, cfg)

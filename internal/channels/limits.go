@@ -13,6 +13,7 @@ type PlanLimit struct {
 	Facebook  int
 	Instagram int
 	Line      int
+	Web       int
 }
 
 // planDoc is a minimal projection of the plans collection used by LimitForCtx.
@@ -38,8 +39,10 @@ func LimitForCtx(ctx context.Context, db *mongo.Database, plan, provider string)
 			if v, ok := doc.Limits.Channels[provider]; ok {
 				return v
 			}
-			// Provider key missing in plan → not offered on this plan.
-			return 0
+			// Provider key missing in the plan document — fall back to the
+			// hardcoded table so newly-added providers (e.g. "web") don't
+			// need a DB migration on every existing plan.
+			return limitFallback(plan, provider)
 		}
 	}
 	// Fallback to hardcoded defaults (legacy / bootstrap).
@@ -77,6 +80,8 @@ func limitFallback(plan, provider string) int {
 		return pl.Instagram
 	case "line":
 		return pl.Line
+	case "web":
+		return pl.Web
 	}
 	return 0
 }
@@ -84,13 +89,13 @@ func limitFallback(plan, provider string) int {
 // hardcodedLimits are bootstrap values used before the plans collection is
 // seeded, and as the ultimate fallback.
 var hardcodedLimits = map[string]PlanLimit{
-	"free":       {Facebook: 1, Instagram: 1, Line: 1},
-	"starter":    {Facebook: 1, Instagram: 1, Line: 1},
-	"basic":      {Facebook: 3, Instagram: 3, Line: 1},
-	"growth":     {Facebook: 5, Instagram: 5, Line: 3},
-	"pro":        {Facebook: 10, Instagram: 10, Line: 5},
-	"enterprise": {Facebook: 100, Instagram: 100, Line: 100},
-	"default":    {Facebook: 1, Instagram: 1, Line: 1},
+	"free":       {Facebook: 1, Instagram: 1, Line: 1, Web: 1},
+	"starter":    {Facebook: 1, Instagram: 1, Line: 1, Web: 1},
+	"basic":      {Facebook: 3, Instagram: 3, Line: 1, Web: 3},
+	"growth":     {Facebook: 5, Instagram: 5, Line: 3, Web: 5},
+	"pro":        {Facebook: 10, Instagram: 10, Line: 5, Web: 10},
+	"enterprise": {Facebook: 100, Instagram: 100, Line: 100, Web: 100},
+	"default":    {Facebook: 1, Instagram: 1, Line: 1, Web: 1},
 }
 
 // LimitsForPlan returns the full hardcoded table for one plan.

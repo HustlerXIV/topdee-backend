@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
@@ -154,12 +155,12 @@ func (h *AuthHandler) processReferralSignup(newTenantID, newUserID, code, tenant
 		return
 	}
 
-	ctx := &noopContext{}
+	ctx := context.Background()
 
 	// Load the programme settings to get discount config.
 	var settings models.ReferralSettings
 	err := h.mongo.DB.Collection("referral_settings").
-		FindOne(nil, bson.M{"_id": "global"}).Decode(&settings)
+		FindOne(ctx, bson.M{"_id": "global"}).Decode(&settings)
 	if err == mongo.ErrNoDocuments {
 		settings = models.DefaultReferralSettings()
 	} else if err != nil {
@@ -173,7 +174,7 @@ func (h *AuthHandler) processReferralSignup(newTenantID, newUserID, code, tenant
 	// Validate the code.
 	var refCode models.ReferralCode
 	if err := h.mongo.DB.Collection("referral_codes").
-		FindOne(nil, bson.M{"_id": code}).Decode(&refCode); err != nil {
+		FindOne(ctx, bson.M{"_id": code}).Decode(&refCode); err != nil {
 		// Invalid code — silently ignore.
 		return
 	}
@@ -183,13 +184,27 @@ func (h *AuthHandler) processReferralSignup(newTenantID, newUserID, code, tenant
 	}
 
 	// Stamp discount on the new tenant.
-	discountExpiry := now.AddDate(0, settings.DiscountDurationMonths, 0)
+	// For "first_purchase" the expiry is set far in the future — the webhook
+	// clears it as soon as the first payment lands, so the date is just a
+	// safety-net fallback. For "duration" the expiry controls how long the
+	// discount is valid across renewals.
+	discountType := settings.DiscountType
+	if discountType == "" {
+		discountType = models.DiscountTypeFirstPurchase
+	}
+	var discountExpiry time.Time
+	if discountType == models.DiscountTypeDuration {
+		discountExpiry = now.AddDate(0, settings.DiscountDurationMonths, 0)
+	} else {
+		discountExpiry = now.AddDate(10, 0, 0) // first_purchase: cleared by webhook, far-future fallback
+	}
 	_, err = h.mongo.DB.Collection("tenants").UpdateOne(
-		nil,
+		ctx,
 		bson.M{"_id": newTenantID},
 		bson.M{"$set": bson.M{
-			"referral_code_used":            code,
-			"referral_discount_expires_at":  discountExpiry,
+			"referral_code_used":           code,
+			"referral_discount_expires_at": discountExpiry,
+			"referral_discount_type":       discountType,
 		}},
 	)
 	if err != nil {
@@ -211,18 +226,18 @@ func (h *AuthHandler) processReferralSignup(newTenantID, newUserID, code, tenant
 		CreatedAt:          now,
 		UpdatedAt:          now,
 	}
-	if _, err := h.mongo.DB.Collection("referrals").InsertOne(nil, referral); err != nil {
+	if _, err := h.mongo.DB.Collection("referrals").InsertOne(ctx, referral); err != nil {
 		log.Printf("[referral] insert referral: %v", err)
 	}
-	_ = ctx
 }
 
 // autoGenerateReferralCode creates a referral code for a new tenant owner.
 // Runs in a goroutine — non-blocking.
 func (h *AuthHandler) autoGenerateReferralCode(tenantID, userID, tenantName string) {
+	ctx := context.Background()
 	// Check if one already exists (e.g. Google OAuth signup may call Register path).
 	count, _ := h.mongo.DB.Collection("referral_codes").
-		CountDocuments(nil, bson.M{"tenant_id": tenantID})
+		CountDocuments(ctx, bson.M{"tenant_id": tenantID})
 	if count > 0 {
 		return
 	}
@@ -238,7 +253,7 @@ func (h *AuthHandler) autoGenerateReferralCode(tenantID, userID, tenantName stri
 		UserID:    userID,
 		CreatedAt: time.Now().UTC(),
 	}
-	if _, err := h.mongo.DB.Collection("referral_codes").InsertOne(nil, code); err != nil {
+	if _, err := h.mongo.DB.Collection("referral_codes").InsertOne(ctx, code); err != nil {
 		if !mongo.IsDuplicateKeyError(err) {
 			log.Printf("[referral] insert auto-code: %v", err)
 		}
@@ -265,12 +280,13 @@ func generateReferralCode(m *db.Mongo, tenantName string) (string, error) {
 	year := fmt.Sprintf("%02d", time.Now().Year()%100)
 	candidate := base + year
 
+	ctx := context.Background()
 	for i := 0; i < 200; i++ {
 		code := candidate
 		if i > 0 {
 			code = fmt.Sprintf("%s%d", candidate, i)
 		}
-		n, _ := m.DB.Collection("referral_codes").CountDocuments(nil, bson.M{"_id": code})
+		n, _ := m.DB.Collection("referral_codes").CountDocuments(ctx, bson.M{"_id": code})
 		if n == 0 {
 			return code, nil
 		}
@@ -278,18 +294,8 @@ func generateReferralCode(m *db.Mongo, tenantName string) (string, error) {
 	return base + uuid.NewString()[:4], nil
 }
 
-// noopContext satisfies the minimal interface needed for mongo nil-context calls.
-type noopContext struct{}
-
-func (n *noopContext) Done() <-chan struct{} { return nil }
-
-// UpdatePayoutType lets owners change their wallet's payout preference.
-//
-// PATCH /api/v1/referral/wallet/payout-type
-func (h *AuthHandler) dummy() {
-	// placeholder to avoid import issues — real implementation in referral.go
-	_ = options.Update()
-}
+// dummy is a placeholder to keep the options import used.
+func (h *AuthHandler) dummy() { _ = options.Update() }
 
 type loginReq struct {
 	Email    string `json:"email"`

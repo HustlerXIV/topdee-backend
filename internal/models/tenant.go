@@ -120,6 +120,10 @@ type Tenant struct {
 	// ReferralDiscountExpiresAt is when the signup discount (e.g. 10% off)
 	// stops being applied at Stripe Checkout. Nil = no discount.
 	ReferralDiscountExpiresAt *time.Time `bson:"referral_discount_expires_at,omitempty" json:"referral_discount_expires_at,omitempty"`
+	// ReferralDiscountType mirrors the programme setting at the time of signup:
+	// "first_purchase" (cleared after first payment) or "duration" (valid for N months).
+	// Empty is treated as "first_purchase" for backward compatibility.
+	ReferralDiscountType string `bson:"referral_discount_type,omitempty" json:"referral_discount_type,omitempty"`
 	CreatedAt                 time.Time  `bson:"created_at" json:"created_at"`
 }
 

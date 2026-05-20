@@ -9,6 +9,7 @@ package handlers
 //   POST /api/v1/admin/referral/wallets/:id/payout  → mark manual payout as done
 
 import (
+	"context"
 	"fmt"
 	"time"
 
@@ -19,6 +20,7 @@ import (
 	"go.mongodb.org/mongo-driver/mongo/options"
 
 	"github.com/topdee/backend/internal/db"
+	"github.com/topdee/backend/internal/middleware"
 	"github.com/topdee/backend/internal/models"
 )
 
@@ -273,13 +275,206 @@ func (h *AdminReferralHandler) UpdateWalletPayoutType(c *fiber.Ctx) error {
 	return c.SendStatus(fiber.StatusNoContent)
 }
 
+// ListPayoutRequests returns all payout requests, optionally filtered by status.
+//
+// GET /api/v1/admin/referral/payout-requests?status=pending
+func (h *AdminReferralHandler) ListPayoutRequests(c *fiber.Ctx) error {
+	filter := bson.M{}
+	if s := c.Query("status"); s != "" {
+		filter["status"] = s
+	}
+
+	cur, err := h.mongo.DB.Collection("payout_requests").Find(
+		c.Context(),
+		filter,
+		options.Find().SetSort(bson.D{{Key: "created_at", Value: -1}}).SetLimit(200),
+	)
+	if err != nil {
+		return err
+	}
+	defer cur.Close(c.Context())
+
+	var requests []models.PayoutRequest
+	if err := cur.All(c.Context(), &requests); err != nil {
+		return err
+	}
+	if requests == nil {
+		requests = []models.PayoutRequest{}
+	}
+
+	// Enrich with tenant names.
+	ids := make([]string, 0, len(requests))
+	seen := map[string]bool{}
+	for _, r := range requests {
+		if !seen[r.TenantID] {
+			ids = append(ids, r.TenantID)
+			seen[r.TenantID] = true
+		}
+	}
+	nameMap := map[string]string{}
+	if len(ids) > 0 {
+		tCur, err := h.mongo.DB.Collection("tenants").Find(
+			c.Context(),
+			bson.M{"_id": bson.M{"$in": ids}},
+			options.Find().SetProjection(bson.M{"_id": 1, "name": 1}),
+		)
+		if err == nil {
+			defer tCur.Close(c.Context())
+			var ts []struct {
+				ID   string `bson:"_id"`
+				Name string `bson:"name"`
+			}
+			_ = tCur.All(c.Context(), &ts)
+			for _, t := range ts {
+				nameMap[t.ID] = t.Name
+			}
+		}
+	}
+
+	type row struct {
+		models.PayoutRequest
+		TenantName string `json:"tenant_name"`
+	}
+	out := make([]row, 0, len(requests))
+	for _, r := range requests {
+		out = append(out, row{PayoutRequest: r, TenantName: nameMap[r.TenantID]})
+	}
+	return c.JSON(out)
+}
+
+// ApprovePayoutRequest marks a pending payout request as approved.
+// The wallet was already debited at submission time — this just confirms
+// that the admin has sent the bank transfer.
+//
+// POST /api/v1/admin/referral/payout-requests/:id/approve
+func (h *AdminReferralHandler) ApprovePayoutRequest(c *fiber.Ctx) error {
+	reqID := c.Params("id")
+	if reqID == "" {
+		return fiber.NewError(fiber.StatusBadRequest, "missing request id")
+	}
+
+	var req struct {
+		AdminNote string `json:"admin_note"`
+	}
+	_ = c.BodyParser(&req)
+
+	var pr models.PayoutRequest
+	if err := h.mongo.DB.Collection("payout_requests").
+		FindOne(c.Context(), bson.M{"_id": reqID}).Decode(&pr); err == mongo.ErrNoDocuments {
+		return fiber.NewError(fiber.StatusNotFound, "payout request not found")
+	} else if err != nil {
+		return err
+	}
+	if pr.Status != models.PayoutRequestStatusPending {
+		return fiber.NewError(fiber.StatusBadRequest, "request is not in pending status")
+	}
+
+	now := time.Now().UTC()
+	adminUserID := middleware.UserID(c)
+
+	_, err := h.mongo.DB.Collection("payout_requests").UpdateOne(
+		c.Context(),
+		bson.M{"_id": reqID},
+		bson.M{"$set": bson.M{
+			"status":      models.PayoutRequestStatusApproved,
+			"approved_by": adminUserID,
+			"approved_at": now,
+			"admin_note":  req.AdminNote,
+			"updated_at":  now,
+		}},
+	)
+	if err != nil {
+		return err
+	}
+
+	return c.JSON(fiber.Map{
+		"ok":     true,
+		"amount": pr.Amount,
+	})
+}
+
+// RejectPayoutRequest marks a pending payout request as rejected and
+// refunds the amount back to the tenant's wallet.
+//
+// POST /api/v1/admin/referral/payout-requests/:id/reject
+func (h *AdminReferralHandler) RejectPayoutRequest(c *fiber.Ctx) error {
+	reqID := c.Params("id")
+	if reqID == "" {
+		return fiber.NewError(fiber.StatusBadRequest, "missing request id")
+	}
+
+	var req struct {
+		AdminNote string `json:"admin_note"`
+	}
+	_ = c.BodyParser(&req)
+
+	var pr models.PayoutRequest
+	if err := h.mongo.DB.Collection("payout_requests").
+		FindOne(c.Context(), bson.M{"_id": reqID}).Decode(&pr); err == mongo.ErrNoDocuments {
+		return fiber.NewError(fiber.StatusNotFound, "payout request not found")
+	} else if err != nil {
+		return err
+	}
+	if pr.Status != models.PayoutRequestStatusPending {
+		return fiber.NewError(fiber.StatusBadRequest, "request is not in pending status")
+	}
+
+	now := time.Now().UTC()
+	adminUserID := middleware.UserID(c)
+
+	// Refund the amount back to the wallet.
+	if _, err := h.mongo.DB.Collection("wallets").UpdateOne(
+		c.Context(),
+		bson.M{"_id": pr.TenantID},
+		bson.M{
+			"$inc": bson.M{"balance": pr.Amount},
+			"$set": bson.M{"tenant_id": pr.TenantID, "updated_at": now},
+			"$setOnInsert": bson.M{"payout_type": models.PayoutTypeManual},
+		},
+		options.Update().SetUpsert(true),
+	); err != nil {
+		return err
+	}
+
+	// Record refund transaction.
+	txn := models.WalletTransaction{
+		ID:          uuid.NewString(),
+		TenantID:    pr.TenantID,
+		Type:        models.TxnTypeCommission, // reuse as a credit entry
+		Amount:      pr.Amount,
+		Description: fmt.Sprintf("คืนเงินจากคำขอเบิกที่ถูกปฏิเสธ — ฿%.2f", float64(pr.Amount)/100),
+		CreatedAt:   now,
+	}
+	if _, err := h.mongo.DB.Collection("wallet_transactions").InsertOne(c.Context(), txn); err != nil {
+		return err
+	}
+
+	// Update payout request status.
+	_, err := h.mongo.DB.Collection("payout_requests").UpdateOne(
+		c.Context(),
+		bson.M{"_id": reqID},
+		bson.M{"$set": bson.M{
+			"status":      models.PayoutRequestStatusRejected,
+			"approved_by": adminUserID,
+			"approved_at": now,
+			"admin_note":  req.AdminNote,
+			"updated_at":  now,
+		}},
+	)
+	if err != nil {
+		return err
+	}
+
+	return c.JSON(fiber.Map{"ok": true, "refunded": pr.Amount})
+}
+
 // ── shared helper ─────────────────────────────────────────────────────────────
 
 // loadReferralSettings fetches the settings doc, falling back to defaults.
-func loadReferralSettings(m *db.Mongo, ctx interface{}) (models.ReferralSettings, error) {
+func loadReferralSettings(m *db.Mongo, ctx context.Context) (models.ReferralSettings, error) {
 	var s models.ReferralSettings
 	err := m.DB.Collection("referral_settings").
-		FindOne(nil, bson.M{"_id": "global"}).Decode(&s)
+		FindOne(ctx, bson.M{"_id": "global"}).Decode(&s)
 	if err == mongo.ErrNoDocuments {
 		return models.DefaultReferralSettings(), nil
 	}

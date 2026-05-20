@@ -251,6 +251,22 @@ func (h *BillingHandler) CreatePromptPayCheckout(c *fiber.Ctx) error {
 		return fiber.NewError(fiber.StatusBadGateway, "stripe customer create: "+err.Error())
 	}
 
+	// Apply referral discount when the tenant used a referral code and their
+	// discount window is still active.
+	//
+	// NOTE: PromptPay uses Stripe payment mode (one-time charge), not
+	// subscription mode. Stripe's "repeating" coupons only work on
+	// subscriptions, so we apply the discount directly to the unit amount
+	// instead of via a coupon object. The discount re-applies on every
+	// PromptPay renewal as long as referral_discount_expires_at is in the future.
+	var promptPayDiscountPct int
+	if t.ReferralDiscountExpiresAt != nil && time.Now().UTC().Before(*t.ReferralDiscountExpiresAt) {
+		if settings, serr := loadReferralSettings(h.mongo, c.Context()); serr == nil && settings.DiscountPercent > 0 {
+			promptPayDiscountPct = settings.DiscountPercent
+			amountSatang = amountSatang * int64(100-promptPayDiscountPct) / 100
+		}
+	}
+
 	params := &stripe.CheckoutSessionParams{
 		Mode:               stripe.String(string(stripe.CheckoutSessionModePayment)),
 		Customer:           stripe.String(customerID),
@@ -269,7 +285,13 @@ func (h *BillingHandler) CreatePromptPayCheckout(c *fiber.Ctx) error {
 				Currency:   stripe.String("thb"),
 				UnitAmount: stripe.Int64(amountSatang),
 				ProductData: &stripe.CheckoutSessionLineItemPriceDataProductDataParams{
-					Name: stripe.String(plan.DisplayName + " — " + periodLabel),
+					Name: stripe.String(func() string {
+						name := plan.DisplayName + " — " + periodLabel
+						if promptPayDiscountPct > 0 {
+							name += fmt.Sprintf(" (ส่วนลด %d%% Referral / %d%% Referral Discount)", promptPayDiscountPct, promptPayDiscountPct)
+						}
+						return name
+					}()),
 				},
 			},
 			Quantity: stripe.Int64(1),
@@ -644,9 +666,13 @@ func (h *BillingHandler) SyncCheckoutSession(c *fiber.Ctx) error {
 		if planSlug != "" {
 			updates["plan"] = planSlug
 		}
+		syncUpdate := bson.M{"$set": updates}
+		if existing.ReferralDiscountType == models.DiscountTypeFirstPurchase || existing.ReferralDiscountType == "" {
+			syncUpdate["$unset"] = bson.M{"referral_discount_expires_at": ""}
+		}
 		_, _ = h.mongo.DB.Collection("tenants").UpdateOne(ctx,
 			bson.M{"_id": tid},
-			bson.M{"$set": updates},
+			syncUpdate,
 		)
 
 		// ── Upsert Payment record (idempotent: session ID is _id) ────────────────
@@ -682,11 +708,17 @@ func (h *BillingHandler) SyncCheckoutSession(c *fiber.Ctx) error {
 			ReceiptURL:  receiptURL,
 			CreatedAt:   now,
 		}
-		_, _ = h.mongo.DB.Collection("payments").ReplaceOne(ctx,
+		payResult, _ := h.mongo.DB.Collection("payments").ReplaceOne(ctx,
 			bson.M{"_id": payment.ID},
 			payment,
 			options.Replace().SetUpsert(true),
 		)
+		// Credit referral commission only on the first insert (UpsertedCount==1).
+		// Both SyncCheckoutSession and the Stripe webhook may process the same
+		// session — this guard prevents double-crediting.
+		if payResult != nil && payResult.UpsertedCount > 0 {
+			go creditReferralCommission(h.mongo, &existing)
+		}
 
 		return c.SendStatus(fiber.StatusNoContent)
 	}
@@ -916,6 +948,10 @@ type BillingInfoResponse struct {
 	HasSubscription   bool                 `json:"has_subscription"`
 	HasStripeCustomer bool                 `json:"has_stripe_customer"`
 	Usage             BillingUsage         `json:"usage"`
+	// ReferralDiscountPercent is > 0 when the tenant has an active referral
+	// discount. The frontend uses this to show a discount badge on plan cards.
+	ReferralDiscountPercent   int        `json:"referral_discount_percent,omitempty"`
+	ReferralDiscountExpiresAt *time.Time `json:"referral_discount_expires_at,omitempty"`
 }
 
 // GET /api/v1/billing
@@ -953,7 +989,7 @@ func (h *BillingHandler) GetInfo(c *fiber.Ctx) error {
 			"created_at": bson.M{"$gte": startOfMonth},
 		})
 
-	return c.JSON(BillingInfoResponse{
+	resp := BillingInfoResponse{
 		Plan:              &plan,
 		Subscription:      t.Subscription,
 		HasSubscription:   t.StripeSubscriptionID != "",
@@ -963,5 +999,25 @@ func (h *BillingHandler) GetInfo(c *fiber.Ctx) error {
 			Channels:          int(chanCount),
 			MessagesThisMonth: int(msgCount),
 		},
-	})
+	}
+
+	// Include referral discount when still active.
+	// first_purchase: only show while on the free plan (cleared by webhook on payment).
+	// duration:       show until expiry regardless of plan (applies to renewals too).
+	if t.ReferralDiscountExpiresAt != nil && time.Now().UTC().Before(*t.ReferralDiscountExpiresAt) {
+		discountType := t.ReferralDiscountType
+		if discountType == "" {
+			discountType = models.DiscountTypeFirstPurchase // safe default
+		}
+		onFreePlan := t.Plan == "" || t.Plan == "free"
+		show := discountType == models.DiscountTypeDuration || onFreePlan
+		if show {
+			if settings, serr := loadReferralSettings(h.mongo, ctx); serr == nil && settings.DiscountPercent > 0 {
+				resp.ReferralDiscountPercent = settings.DiscountPercent
+				resp.ReferralDiscountExpiresAt = t.ReferralDiscountExpiresAt
+			}
+		}
+	}
+
+	return c.JSON(resp)
 }

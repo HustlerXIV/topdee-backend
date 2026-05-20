@@ -8,6 +8,7 @@ const (
 	ProviderFacebook  = "facebook"
 	ProviderInstagram = "instagram"
 	ProviderLine      = "line"
+	ProviderWeb       = "web"
 )
 
 // ChannelConnection statuses.

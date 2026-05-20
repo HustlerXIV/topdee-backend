@@ -8,13 +8,22 @@ import "time"
 // with _id = "global". Amounts are in satang (฿1 = 100 satang) to avoid
 // floating-point arithmetic.
 
+// DiscountType controls when the referred-tenant's signup discount expires.
+//   "first_purchase" — cleared immediately after the first successful payment (default)
+//   "duration"       — valid for DiscountDurationMonths months, applies to renewals too
+const (
+	DiscountTypeFirstPurchase = "first_purchase"
+	DiscountTypeDuration      = "duration"
+)
+
 type ReferralSettings struct {
 	ID                        string    `bson:"_id" json:"id"`
 	Enabled                   bool      `bson:"enabled" json:"enabled"`
 	FirstCommissionAmount     int       `bson:"first_commission_amount" json:"first_commission_amount"`         // satang, default 10000 = ฿100
 	RecurringCommissionAmount int       `bson:"recurring_commission_amount" json:"recurring_commission_amount"` // satang, default 5000 = ฿50
 	DiscountPercent           int       `bson:"discount_percent" json:"discount_percent"`                       // default 10 = 10%
-	DiscountDurationMonths    int       `bson:"discount_duration_months" json:"discount_duration_months"`       // default 12
+	DiscountType              string    `bson:"discount_type" json:"discount_type"`                             // "first_purchase" | "duration"
+	DiscountDurationMonths    int       `bson:"discount_duration_months" json:"discount_duration_months"`       // only used when DiscountType == "duration", default 12
 	DefaultPayoutType         string    `bson:"default_payout_type" json:"default_payout_type"`                 // "manual" | "credit"
 	UpdatedAt                 time.Time `bson:"updated_at" json:"updated_at"`
 }
@@ -28,7 +37,8 @@ func DefaultReferralSettings() ReferralSettings {
 		FirstCommissionAmount:     10000,
 		RecurringCommissionAmount: 5000,
 		DiscountPercent:           10,
-		DiscountDurationMonths:    12,
+		DiscountType:              DiscountTypeFirstPurchase,
+		DiscountDurationMonths:    1,
 		DefaultPayoutType:         PayoutTypeManual,
 	}
 }

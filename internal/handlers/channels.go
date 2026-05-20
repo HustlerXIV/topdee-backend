@@ -128,12 +128,46 @@ func (h *ChannelsHandler) List(c *fiber.Ctx) error {
 		views = append(views, h.toView(&conns[i]))
 		used[conns[i].Provider]++
 	}
-	pl := channels.LimitsForPlan(plan)
-	limits := map[string]int{
-		models.ProviderFacebook:  pl.Facebook,
-		models.ProviderInstagram: pl.Instagram,
-		models.ProviderLine:      pl.Line,
+
+	// Build the limits map from the live plans collection so that admin
+	// changes (e.g. setting facebook=0 to hide Facebook on a plan) take
+	// effect immediately without a code deploy.
+	limits := map[string]int{}
+	var planDoc struct {
+		Limits struct {
+			Channels map[string]int `bson:"channels"`
+		} `bson:"limits"`
 	}
+	// Known providers — always appear in the response so the frontend knows
+	// about them even when a plan document pre-dates their addition.
+	knownProviders := []string{
+		models.ProviderFacebook,
+		models.ProviderInstagram,
+		models.ProviderLine,
+		models.ProviderWeb,
+	}
+
+	if err := h.mongo.DB.Collection("plans").
+		FindOne(c.Context(), bson.M{"_id": plan}).Decode(&planDoc); err == nil && planDoc.Limits.Channels != nil {
+		// Seed from MongoDB first (explicit admin config wins).
+		for provider, cap := range planDoc.Limits.Channels {
+			limits[provider] = cap
+		}
+		// For any known provider not yet in the plan document, fall back to
+		// the hardcoded default so newly-added providers don't require a
+		// DB migration on every existing plan.
+		for _, p := range knownProviders {
+			if _, ok := limits[p]; !ok {
+				limits[p] = channels.LimitFor(plan, p)
+			}
+		}
+	} else {
+		// Fallback to hardcoded table (bootstrap / plan not seeded yet).
+		for _, p := range knownProviders {
+			limits[p] = channels.LimitFor(plan, p)
+		}
+	}
+
 	return c.JSON(channelsResponse{Connections: views, Limits: limits, Used: used})
 }
 
@@ -639,4 +673,83 @@ func (h *ChannelsHandler) InstagramOAuthConnect(c *fiber.Ctx) error {
 // don't need to import the uuid package.
 func newUUID() string {
 	return uuid.NewString()
+}
+
+// ── POST /api/v1/channels/web ──────────────────────────────────────────────
+//
+// Creates a Web Widget connection. A UUID is auto-generated as the widget_id
+// (ExternalID). The tenant pastes this into the JS embed snippet on their site.
+//
+// Body (optional):
+//
+//	{
+//	  "display_name":     "My Website Chat",
+//	  "bot_name":         "Aria",
+//	  "greeting_message": "Hi! How can I help?",
+//	  "accent_color":     "#6366f1"
+//	}
+type webConnectReq struct {
+	DisplayName     string `json:"display_name"`
+	BotName         string `json:"bot_name"`
+	GreetingMessage string `json:"greeting_message"`
+	AccentColor     string `json:"accent_color"`
+}
+
+type webConnectResp struct {
+	Connection connectionView `json:"connection"`
+	// WidgetID is the public identifier to embed in the script tag.
+	WidgetID string `json:"widget_id"`
+	// EmbedCode is a ready-to-copy <script> tag.
+	EmbedCode string `json:"embed_code"`
+}
+
+func (h *ChannelsHandler) ConnectWeb(c *fiber.Ctx) error {
+	tid := middleware.TenantID(c)
+	uid := middleware.UserID(c)
+
+	var req webConnectReq
+	_ = c.BodyParser(&req) // body is optional
+
+	if err := h.enforceLimit(c, tid, models.ProviderWeb, ""); err != nil {
+		return err
+	}
+
+	widgetID := uuid.NewString()
+	displayName := req.DisplayName
+	if displayName == "" {
+		displayName = "Website Chat"
+	}
+
+	config := map[string]any{}
+	if req.BotName != "" {
+		config["bot_name"] = req.BotName
+	}
+	if req.GreetingMessage != "" {
+		config["greeting_message"] = req.GreetingMessage
+	}
+	if req.AccentColor != "" {
+		config["accent_color"] = req.AccentColor
+	}
+
+	conn := &models.ChannelConnection{
+		TenantID:    tid,
+		Provider:    models.ProviderWeb,
+		ExternalID:  widgetID,
+		DisplayName: displayName,
+		Credentials: map[string]string{},
+		Config:      config,
+		Status:      models.ChannelStatusActive,
+		CreatedBy:   uid,
+	}
+	if err := h.store.Upsert(c.Context(), conn); err != nil {
+		return err
+	}
+
+	embedCode := `<script src="` + strings.TrimRight(h.cfg.BackendPublicURL, "/") + `/widget.js" data-widget-id="` + widgetID + `"></script>`
+
+	return c.Status(fiber.StatusCreated).JSON(webConnectResp{
+		Connection: h.toView(conn),
+		WidgetID:   widgetID,
+		EmbedCode:  embedCode,
+	})
 }

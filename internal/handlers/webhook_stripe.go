@@ -204,11 +204,20 @@ func handleCheckoutCompleted(ctx context.Context, mongo *db.Mongo, ev stripe.Eve
 			ReceiptURL:  receiptURL,
 			CreatedAt:   now,
 		}
-		_, _ = mongo.DB.Collection("payments").ReplaceOne(ctx,
+		payResult, _ := mongo.DB.Collection("payments").ReplaceOne(ctx,
 			bson.M{"_id": payment.ID},
 			payment,
 			options.Replace().SetUpsert(true),
 		)
+		// ── Referral commission (PromptPay) ──────────────────────────────────
+		// invoice.payment_succeeded is never emitted for payment-mode checkouts,
+		// so we credit the commission here instead.
+		// UpsertedCount==1 means this is the first time we've seen this session
+		// (idempotency guard — SyncCheckoutSession may have already processed it).
+		if payResult != nil && payResult.UpsertedCount > 0 {
+			go creditReferralCommission(mongo, t)
+		}
+
 		return nil
 	}
 

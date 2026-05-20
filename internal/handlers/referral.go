@@ -163,21 +163,46 @@ func (h *ReferralHandler) GetWallet(c *fiber.Ctx) error {
 	})
 }
 
-type payoutReq struct {
-	// PayoutType overrides the wallet's default. Omit to use wallet default.
-	PayoutType string `json:"payout_type"` // "manual" | "credit"
+// ── Payout request (bank transfer) ───────────────────────────────────────────
+
+type submitPayoutReq struct {
+	// Bank details
+	BankName      string `json:"bank_name"`
+	AccountNumber string `json:"account_number"`
+	AccountName   string `json:"account_name"`
+	// Tax details
+	TaxID    string `json:"tax_id"`
+	FullName string `json:"full_name"`
+	Address  string `json:"address"`
+	// PDPA consent — must be true to proceed
+	ConsentGiven bool `json:"consent_given"`
 }
 
-// RequestPayout either records a manual payout request (for admin to action)
-// or applies the balance as a credit on the next Stripe invoice.
+// SubmitPayoutRequest creates a new payout request with bank + tax details.
+// The wallet balance is deducted immediately as a hold; admin approves and
+// confirms the bank transfer separately.
 //
-// POST /api/v1/referral/wallet/payout
-func (h *ReferralHandler) RequestPayout(c *fiber.Ctx) error {
+// POST /api/v1/referral/wallet/payout-request
+func (h *ReferralHandler) SubmitPayoutRequest(c *fiber.Ctx) error {
 	tid := middleware.TenantID(c)
 
-	var req payoutReq
-	_ = c.BodyParser(&req)
+	var req submitPayoutReq
+	if err := c.BodyParser(&req); err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid body")
+	}
 
+	// Validate required fields.
+	if req.BankName == "" || req.AccountNumber == "" || req.AccountName == "" {
+		return fiber.NewError(fiber.StatusBadRequest, "bank_name, account_number, account_name are required")
+	}
+	if req.TaxID == "" || req.FullName == "" || req.Address == "" {
+		return fiber.NewError(fiber.StatusBadRequest, "tax_id, full_name, address are required")
+	}
+	if !req.ConsentGiven {
+		return fiber.NewError(fiber.StatusBadRequest, "consent_given must be true")
+	}
+
+	// Load wallet.
 	var wallet models.Wallet
 	if err := h.mongo.DB.Collection("wallets").
 		FindOne(c.Context(), bson.M{"_id": tid}).Decode(&wallet); err == mongo.ErrNoDocuments {
@@ -185,77 +210,94 @@ func (h *ReferralHandler) RequestPayout(c *fiber.Ctx) error {
 	} else if err != nil {
 		return err
 	}
-
 	if wallet.Balance <= 0 {
 		return fiber.NewError(fiber.StatusBadRequest, "wallet balance is zero")
 	}
 
-	payoutType := wallet.PayoutType
-	if req.PayoutType == models.PayoutTypeManual || req.PayoutType == models.PayoutTypeCredit {
-		payoutType = req.PayoutType
+	// Check there is no already-pending request.
+	existing, _ := h.mongo.DB.Collection("payout_requests").CountDocuments(
+		c.Context(), bson.M{"tenant_id": tid, "status": models.PayoutRequestStatusPending},
+	)
+	if existing > 0 {
+		return fiber.NewError(fiber.StatusConflict, "คุณมีคำขอเบิกเงินที่รอดำเนินการอยู่แล้ว")
 	}
 
-	amount := wallet.Balance
 	now := time.Now().UTC()
+	amount := wallet.Balance
 
-	if payoutType == models.PayoutTypeManual {
-		// Record a payout transaction and zero the balance. Admin will pay
-		// out externally and confirm in the admin panel.
-		txn := models.WalletTransaction{
-			ID:          uuid.NewString(),
-			TenantID:    tid,
-			Type:        models.TxnTypePayout,
-			Amount:      -amount,
-			Description: fmt.Sprintf("Manual payout request — ฿%.2f", float64(amount)/100),
-			CreatedAt:   now,
-		}
-		if _, err := h.mongo.DB.Collection("wallet_transactions").InsertOne(c.Context(), txn); err != nil {
-			return err
-		}
-		_, err := h.mongo.DB.Collection("wallets").UpdateOne(
-			c.Context(),
-			bson.M{"_id": tid},
-			bson.M{"$set": bson.M{"balance": 0, "updated_at": now}},
-		)
-		if err != nil {
-			return err
-		}
-		return c.JSON(fiber.Map{
-			"ok":      true,
-			"type":    "manual",
-			"amount":  amount,
-			"message": "Payout request recorded. Platform admin will process it.",
-		})
-	}
-
-	// Credit — apply to next Stripe invoice via a balance credit on the
-	// Stripe customer. For now we just record it locally and admin applies it;
-	// in a future iteration this can call stripe.CustomerBalanceTransaction.New.
+	// Deduct from wallet immediately (hold).
 	txn := models.WalletTransaction{
 		ID:          uuid.NewString(),
 		TenantID:    tid,
-		Type:        models.TxnTypeCreditApplied,
+		Type:        models.TxnTypePayout,
 		Amount:      -amount,
-		Description: fmt.Sprintf("Bill credit applied — ฿%.2f", float64(amount)/100),
+		Description: fmt.Sprintf("คำขอเบิกเงิน — ฿%.2f (รอดำเนินการ)", float64(amount)/100),
 		CreatedAt:   now,
 	}
 	if _, err := h.mongo.DB.Collection("wallet_transactions").InsertOne(c.Context(), txn); err != nil {
 		return err
 	}
-	_, err := h.mongo.DB.Collection("wallets").UpdateOne(
+	if _, err := h.mongo.DB.Collection("wallets").UpdateOne(
 		c.Context(),
 		bson.M{"_id": tid},
 		bson.M{"$set": bson.M{"balance": 0, "updated_at": now}},
+	); err != nil {
+		return err
+	}
+
+	// Create the payout request record.
+	pr := models.PayoutRequest{
+		ID:            uuid.NewString(),
+		TenantID:      tid,
+		Amount:        amount,
+		BankName:      req.BankName,
+		AccountNumber: req.AccountNumber,
+		AccountName:   req.AccountName,
+		TaxID:         req.TaxID,
+		FullName:      req.FullName,
+		Address:       req.Address,
+		ConsentGiven:  true,
+		ConsentAt:     now,
+		Status:        models.PayoutRequestStatusPending,
+		CreatedAt:     now,
+		UpdatedAt:     now,
+	}
+	if _, err := h.mongo.DB.Collection("payout_requests").InsertOne(c.Context(), pr); err != nil {
+		return err
+	}
+
+	return c.Status(fiber.StatusCreated).JSON(fiber.Map{
+		"ok":      true,
+		"amount":  amount,
+		"request": pr,
+		"message": fmt.Sprintf("คำขอเบิกเงิน ฿%.2f ถูกบันทึกแล้ว ทีมงานจะดำเนินการภายใน 7 วันทำการ", float64(amount)/100),
+	})
+}
+
+// GetMyPayoutRequests returns the tenant's payout request history (newest first).
+//
+// GET /api/v1/referral/wallet/payout-requests
+func (h *ReferralHandler) GetMyPayoutRequests(c *fiber.Ctx) error {
+	tid := middleware.TenantID(c)
+
+	cur, err := h.mongo.DB.Collection("payout_requests").Find(
+		c.Context(),
+		bson.M{"tenant_id": tid},
+		options.Find().SetSort(bson.D{{Key: "created_at", Value: -1}}).SetLimit(50),
 	)
 	if err != nil {
 		return err
 	}
-	return c.JSON(fiber.Map{
-		"ok":      true,
-		"type":    "credit",
-		"amount":  amount,
-		"message": "Credit applied. It will be deducted from your next invoice.",
-	})
+	defer cur.Close(c.Context())
+
+	var requests []models.PayoutRequest
+	if err := cur.All(c.Context(), &requests); err != nil {
+		return err
+	}
+	if requests == nil {
+		requests = []models.PayoutRequest{}
+	}
+	return c.JSON(requests)
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────

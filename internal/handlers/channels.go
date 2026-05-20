@@ -128,12 +128,33 @@ func (h *ChannelsHandler) List(c *fiber.Ctx) error {
 		views = append(views, h.toView(&conns[i]))
 		used[conns[i].Provider]++
 	}
-	pl := channels.LimitsForPlan(plan)
-	limits := map[string]int{
-		models.ProviderFacebook:  pl.Facebook,
-		models.ProviderInstagram: pl.Instagram,
-		models.ProviderLine:      pl.Line,
+
+	// Build the limits map from the live plans collection so that admin
+	// changes (e.g. setting facebook=0 to hide Facebook on a plan) take
+	// effect immediately without a code deploy.
+	limits := map[string]int{}
+	var planDoc struct {
+		Limits struct {
+			Channels map[string]int `bson:"channels"`
+		} `bson:"limits"`
 	}
+	if err := h.mongo.DB.Collection("plans").
+		FindOne(c.Context(), bson.M{"_id": plan}).Decode(&planDoc); err == nil && planDoc.Limits.Channels != nil {
+		// Only include providers that are explicitly configured. A missing key
+		// or value of 0 both mean "not available on this plan".
+		for provider, cap := range planDoc.Limits.Channels {
+			limits[provider] = cap
+		}
+	} else {
+		// Fallback to hardcoded table (bootstrap / plan not seeded yet).
+		pl := channels.LimitsForPlan(plan)
+		limits = map[string]int{
+			models.ProviderFacebook:  pl.Facebook,
+			models.ProviderInstagram: pl.Instagram,
+			models.ProviderLine:      pl.Line,
+		}
+	}
+
 	return c.JSON(channelsResponse{Connections: views, Limits: limits, Used: used})
 }
 

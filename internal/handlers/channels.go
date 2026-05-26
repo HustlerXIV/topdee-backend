@@ -99,10 +99,19 @@ func (h *ChannelsHandler) webhookURL(provider, externalID string) string {
 
 // channelsResponse — payload of GET /channels. We bundle the per-provider
 // usage / limit pairs so the UI can show "2 / 3 Facebook pages connected".
+//
+// `ChannelLimitMode` tells the frontend which capping strategy this plan
+// uses: "per_provider" renders separate per-provider sections (legacy UI),
+// "total" renders a single "Connect a channel" picker bounded by `Total`.
+// `TotalUsed` is the sum across providers, surfaced so the picker can
+// show "3 / 5 channels used" at a glance.
 type channelsResponse struct {
-	Connections []connectionView `json:"connections"`
-	Limits      map[string]int   `json:"limits"`
-	Used        map[string]int   `json:"used"`
+	Connections      []connectionView `json:"connections"`
+	Limits           map[string]int   `json:"limits"`
+	Used             map[string]int   `json:"used"`
+	ChannelLimitMode string           `json:"channel_limit_mode"`
+	Total            int              `json:"total"`
+	TotalUsed        int              `json:"total_used"`
 }
 
 // ── GET /api/v1/channels ───────────────────────────────────────────────
@@ -124,51 +133,47 @@ func (h *ChannelsHandler) List(c *fiber.Ctx) error {
 
 	views := make([]connectionView, 0, len(conns))
 	used := map[string]int{}
+	totalUsed := 0
 	for i := range conns {
 		views = append(views, h.toView(&conns[i]))
 		used[conns[i].Provider]++
+		totalUsed++
 	}
 
-	// Build the limits map from the live plans collection so that admin
-	// changes (e.g. setting facebook=0 to hide Facebook on a plan) take
-	// effect immediately without a code deploy.
+	// Load the plan policy once — covers mode, total cap, and per-provider
+	// caps in a single DB roundtrip.
+	policy := channels.PolicyForCtx(c.Context(), h.mongo.DB, plan)
+
+	// Build the per-provider limits map. We always expose the per-provider
+	// caps even in total mode so the frontend can use cap=0 as a "hide this
+	// provider" signal regardless of which capping strategy is in effect.
 	limits := map[string]int{}
-	var planDoc struct {
-		Limits struct {
-			Channels map[string]int `bson:"channels"`
-		} `bson:"limits"`
-	}
-	// Known providers — always appear in the response so the frontend knows
-	// about them even when a plan document pre-dates their addition.
 	knownProviders := []string{
 		models.ProviderFacebook,
 		models.ProviderInstagram,
 		models.ProviderLine,
 		models.ProviderWeb,
 	}
-
-	if err := h.mongo.DB.Collection("plans").
-		FindOne(c.Context(), bson.M{"_id": plan}).Decode(&planDoc); err == nil && planDoc.Limits.Channels != nil {
-		// Seed from MongoDB first (explicit admin config wins).
-		for provider, cap := range planDoc.Limits.Channels {
-			limits[provider] = cap
-		}
-		// For any known provider not yet in the plan document, fall back to
-		// the hardcoded default so newly-added providers don't require a
-		// DB migration on every existing plan.
-		for _, p := range knownProviders {
-			if _, ok := limits[p]; !ok {
-				limits[p] = channels.LimitFor(plan, p)
-			}
-		}
-	} else {
-		// Fallback to hardcoded table (bootstrap / plan not seeded yet).
-		for _, p := range knownProviders {
+	for provider, cap := range policy.ProviderCaps {
+		limits[provider] = cap
+	}
+	// For any known provider not yet in the plan document, fall back to
+	// the hardcoded default so newly-added providers don't require a DB
+	// migration on every existing plan.
+	for _, p := range knownProviders {
+		if _, ok := limits[p]; !ok {
 			limits[p] = channels.LimitFor(plan, p)
 		}
 	}
 
-	return c.JSON(channelsResponse{Connections: views, Limits: limits, Used: used})
+	return c.JSON(channelsResponse{
+		Connections:      views,
+		Limits:           limits,
+		Used:             used,
+		ChannelLimitMode: policy.Mode,
+		Total:            policy.Total,
+		TotalUsed:        totalUsed,
+	})
 }
 
 // ── DELETE /api/v1/channels/:id ────────────────────────────────────────
@@ -410,18 +415,10 @@ func (h *ChannelsHandler) FacebookOAuthConnect(c *fiber.Ctx) error {
 	}
 
 	// Pre-flight: make sure connecting all the requested pages won't bust
-	// the plan limit. We count both existing connections and the new ones.
-	plan := tenantPlan(c.Context(), h.mongo, tid)
-	limit := channels.LimitForCtx(c.Context(), h.mongo.DB, plan, models.ProviderFacebook)
-	used, err := h.store.CountByProvider(c.Context(), tid, models.ProviderFacebook)
-	if err != nil {
+	// the plan limit. The helper handles per-provider vs. total-cap modes
+	// and treats reconnects as free.
+	if err := h.enforceLimitWithAdd(c, tid, models.ProviderFacebook, req.PageIDs); err != nil {
 		return err
-	}
-	if limit >= 0 && int(used)+len(req.PageIDs) > limit {
-		return fiber.NewError(
-			fiber.StatusForbidden,
-			"this plan allows up to "+itoa(limit)+" Facebook pages",
-		)
 	}
 
 	connected := []connectionView{}
@@ -468,27 +465,81 @@ func (h *ChannelsHandler) FacebookOAuthConnect(c *fiber.Ctx) error {
 
 // ── Helpers ────────────────────────────────────────────────────────────
 
-// enforceLimit checks the tenant's plan against `provider` count. It also
-// allows reconnecting an *existing* connection (same external_id) without
-// counting it twice.
+// enforceLimit checks the tenant's plan against the channel cap. Reconnecting
+// an *existing* connection (same external_id) is always allowed — we just
+// upsert without counting it twice. Single-page connect → addCount = 1.
 func (h *ChannelsHandler) enforceLimit(c *fiber.Ctx, tid, provider, externalID string) error {
-	plan := tenantPlan(c.Context(), h.mongo, tid)
-	limit := channels.LimitForCtx(c.Context(), h.mongo.DB, plan, provider)
+	return h.enforceLimitWithAdd(c, tid, provider, []string{externalID})
+}
 
-	// Existing connection? Reconnect is always allowed — we just upsert.
-	existing, err := h.store.FindByExternal(c.Context(), provider, externalID)
-	if err != nil {
-		return err
+// enforceLimitWithAdd is the bulk variant used by the FB / IG OAuth flows,
+// where the customer picks N pages or accounts to connect in one go. It
+// branches on the plan's channel-limit mode:
+//
+//   - "per_provider" mode (default): only the provider-specific cap applies,
+//     same as the legacy behavior.
+//
+//   - "total" mode: the sum across all providers must stay within the plan's
+//     TotalChannels. A provider with an explicit cap of 0 in PlanLimits is
+//     still blocked outright (admins use that to hide a provider from a tier).
+//
+// In both modes, reconnecting an existing external_id owned by this tenant
+// doesn't consume a new slot — we filter those out of the count.
+func (h *ChannelsHandler) enforceLimitWithAdd(c *fiber.Ctx, tid, provider string, externalIDs []string) error {
+	plan := tenantPlan(c.Context(), h.mongo, tid)
+	policy := channels.PolicyForCtx(c.Context(), h.mongo.DB, plan)
+
+	// Hide-by-zero: even in total mode, an admin can pin a provider to 0
+	// on a given plan to gate it out.
+	if policy.ProviderHidden(provider) {
+		return fiber.NewError(
+			fiber.StatusForbidden,
+			"this plan does not include "+provider+" connections",
+		)
 	}
-	if existing != nil && existing.TenantID == tid {
+
+	// Count only the genuinely-new external IDs — reconnects are free.
+	newAdds := 0
+	for _, ext := range externalIDs {
+		if ext == "" {
+			// Auto-generated (e.g. web widget UUID) — always a new slot.
+			newAdds++
+			continue
+		}
+		existing, err := h.store.FindByExternal(c.Context(), provider, ext)
+		if err != nil {
+			return err
+		}
+		if existing != nil && existing.TenantID == tid {
+			continue // reconnect — free
+		}
+		newAdds++
+	}
+	if newAdds == 0 {
+		return nil // everything is a reconnect
+	}
+
+	if policy.IsTotalMode() {
+		used, err := h.store.CountByTenant(c.Context(), tid)
+		if err != nil {
+			return err
+		}
+		if policy.Total >= 0 && int(used)+newAdds > policy.Total {
+			return fiber.NewError(
+				fiber.StatusForbidden,
+				"this plan allows up to "+itoa(policy.Total)+" total channels (currently "+itoa(int(used))+")",
+			)
+		}
 		return nil
 	}
 
+	// Per-provider mode — original behavior.
+	limit := channels.LimitForCtx(c.Context(), h.mongo.DB, plan, provider)
 	used, err := h.store.CountByProvider(c.Context(), tid, provider)
 	if err != nil {
 		return err
 	}
-	if limit >= 0 && int(used) >= limit {
+	if limit >= 0 && int(used)+newAdds > limit {
 		return fiber.NewError(
 			fiber.StatusForbidden,
 			"this plan allows up to "+itoa(limit)+" "+provider+" connections",
@@ -614,18 +665,9 @@ func (h *ChannelsHandler) InstagramOAuthConnect(c *fiber.Ctx) error {
 		byID[a.IGID] = a
 	}
 
-	// Pre-flight plan limit check.
-	plan := tenantPlan(c.Context(), h.mongo, tid)
-	limit := channels.LimitForCtx(c.Context(), h.mongo.DB, plan, models.ProviderInstagram)
-	used, err := h.store.CountByProvider(c.Context(), tid, models.ProviderInstagram)
-	if err != nil {
+	// Pre-flight plan limit check — branches on per-provider vs total mode.
+	if err := h.enforceLimitWithAdd(c, tid, models.ProviderInstagram, req.IGIDs); err != nil {
 		return err
-	}
-	if limit >= 0 && int(used)+len(req.IGIDs) > limit {
-		return fiber.NewError(
-			fiber.StatusForbidden,
-			"this plan allows up to "+itoa(limit)+" Instagram accounts",
-		)
 	}
 
 	connected := []connectionView{}

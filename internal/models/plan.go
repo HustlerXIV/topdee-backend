@@ -47,11 +47,42 @@ type Plan struct {
 	UpdatedAt   time.Time  `bson:"updated_at"   json:"updated_at"`
 }
 
+// ChannelLimitMode toggles between two ways of capping a tenant's channel
+// connections on a plan.
+//
+//   - ChannelLimitModePerProvider — each provider has its own cap, set in
+//     PlanLimits.Channels (the original behavior; default when unset).
+//     Example: facebook=3, line=1, instagram=0 → up to 3 FB, 1 LINE, no IG.
+//
+//   - ChannelLimitModeTotal — a single total cap (PlanLimits.TotalChannels)
+//     bounds the *sum* of connections across all providers. The customer
+//     picks which providers to use, up to the total. Per-provider entries
+//     with a value of 0 still hide that provider (lets admin gate features
+//     like "no Instagram on the free tier" even in total-cap mode).
+const (
+	ChannelLimitModePerProvider = "per_provider"
+	ChannelLimitModeTotal       = "total"
+)
+
 // PlanLimits bundles all the caps for a plan tier.
 type PlanLimits struct {
+	// ChannelLimitMode selects between per-provider caps and a single total
+	// cap. Empty string is treated as "per_provider" so existing plan
+	// documents written before this field existed keep working unchanged.
+	ChannelLimitMode string `bson:"channel_limit_mode,omitempty" json:"channel_limit_mode,omitempty"`
+
+	// TotalChannels is the cap on the SUM of channel connections across
+	// every provider — used only when ChannelLimitMode == "total".
+	// -1 = unlimited. Ignored in per-provider mode.
+	TotalChannels int `bson:"total_channels,omitempty" json:"total_channels,omitempty"`
+
 	// Channels is keyed by provider slug. Value is the max number of
 	// connections of that provider a tenant may have. -1 = unlimited.
 	// Example: {"facebook": 3, "line": 1, "instagram": 0}
+	//
+	// In "total" mode this map is still consulted but only as a *visibility*
+	// gate: a value of 0 hides the provider from the picker. Non-zero
+	// values are ignored for capping in total mode.
 	Channels map[string]int `bson:"channels" json:"channels"`
 
 	// Members is the maximum number of users (team members) per workspace.

@@ -19,12 +19,80 @@ type PlanLimit struct {
 // planDoc is a minimal projection of the plans collection used by LimitForCtx.
 type planDoc struct {
 	Limits struct {
+		ChannelLimitMode string         `bson:"channel_limit_mode"`
+		TotalChannels    int            `bson:"total_channels"`
 		Channels         map[string]int `bson:"channels"`
 		Members          int            `bson:"members"`
 		MessagesPerMonth int            `bson:"messages_per_month"`
 		KnowledgeBases   int            `bson:"knowledge_bases"`
 		StorageMB        int            `bson:"storage_mb"`
 	} `bson:"limits"`
+}
+
+// ChannelPolicy captures the channel-capping rules for one plan. Built once
+// per request (one DB roundtrip) and passed to handlers so per-provider and
+// total-cap checks share the same view of the plan.
+type ChannelPolicy struct {
+	// Mode is either "per_provider" (the default) or "total".
+	Mode string
+	// Total is the cap on the sum of all provider connections — only
+	// meaningful when Mode == "total". -1 means unlimited.
+	Total int
+	// ProviderCaps is the per-provider map exactly as stored on the plan.
+	// In total-cap mode it's still used as a visibility gate (cap == 0
+	// hides a provider entirely).
+	ProviderCaps map[string]int
+}
+
+// IsTotalMode is a tiny helper so call sites read naturally.
+func (p ChannelPolicy) IsTotalMode() bool { return p.Mode == "total" }
+
+// ProviderHidden returns true when a provider has an explicit cap of 0 on
+// this plan, regardless of mode — the admin set it that way to hide the
+// provider from this tier.
+func (p ChannelPolicy) ProviderHidden(provider string) bool {
+	v, ok := p.ProviderCaps[provider]
+	return ok && v == 0
+}
+
+// PolicyForCtx loads the channel policy for a plan in a single DB roundtrip.
+// Falls back to per-provider mode with hardcoded defaults when the plans
+// collection is unavailable or the plan doesn't exist — same shape as the
+// legacy LimitForCtx behavior.
+func PolicyForCtx(ctx context.Context, db *mongo.Database, plan string) ChannelPolicy {
+	if db != nil {
+		tctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+		defer cancel()
+		var doc planDoc
+		if err := db.Collection("plans").FindOne(tctx, bson.M{"_id": plan}).Decode(&doc); err == nil {
+			mode := doc.Limits.ChannelLimitMode
+			if mode == "" {
+				mode = "per_provider"
+			}
+			caps := doc.Limits.Channels
+			if caps == nil {
+				caps = map[string]int{}
+			}
+			return ChannelPolicy{
+				Mode:         mode,
+				Total:        doc.Limits.TotalChannels,
+				ProviderCaps: caps,
+			}
+		}
+	}
+	// Bootstrap fallback — synthesize a per-provider policy from the
+	// hardcoded table so the system stays usable without a seeded plans
+	// collection.
+	pl := LimitsForPlan(plan)
+	return ChannelPolicy{
+		Mode: "per_provider",
+		ProviderCaps: map[string]int{
+			"facebook":  pl.Facebook,
+			"instagram": pl.Instagram,
+			"line":      pl.Line,
+			"web":       pl.Web,
+		},
+	}
 }
 
 // LimitForCtx returns how many `provider` connections `plan` allows by

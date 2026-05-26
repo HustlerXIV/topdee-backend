@@ -93,12 +93,18 @@ func (s *Store) ListByTenant(ctx context.Context, tenantID string) ([]models.Cha
 }
 
 // CountByProvider returns how many connections of `provider` the tenant has —
-// used to enforce plan limits.
+// used to enforce per-provider plan limits.
 func (s *Store) CountByProvider(ctx context.Context, tenantID, provider string) (int64, error) {
 	return s.coll().CountDocuments(ctx, bson.M{
 		"tenant_id": tenantID,
 		"provider":  provider,
 	})
+}
+
+// CountByTenant returns how many connections the tenant has total across
+// every provider — used to enforce a plan's total-channel cap.
+func (s *Store) CountByTenant(ctx context.Context, tenantID string) (int64, error) {
+	return s.coll().CountDocuments(ctx, bson.M{"tenant_id": tenantID})
 }
 
 // Upsert inserts or updates a connection identified by (tenant_id, provider,

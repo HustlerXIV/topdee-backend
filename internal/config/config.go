@@ -41,6 +41,43 @@ type Config struct {
 	// Typically `${BACKEND_PUBLIC_URL}/webhooks/instagram/oauth/callback`.
 	IGOAuthRedirectURI string
 
+	// TikTok Login Kit / Business Messaging app credentials. The user-level
+	// access/refresh tokens are per-tenant and stored in channel_connections.
+	//
+	//   • TTClientKey + TTClientSecret — the TikTok developer app's identity.
+	//     Get them from https://developers.tiktok.com → Manage apps → your app.
+	//     The client_secret is used to sign webhook payloads.
+	//   • TTVerifyToken — optional shared secret echoed in the GET handshake.
+	//     Only enforced when set.
+	//   • TTOAuthRedirectURI — must match an "Allowed redirect URI" registered
+	//     in the TikTok app's Login Kit settings.
+	//     Typically `${BACKEND_PUBLIC_URL}/webhooks/tiktok/oauth/callback`.
+	TTClientKey        string
+	TTClientSecret     string
+	TTVerifyToken      string
+	TTOAuthRedirectURI string
+
+	// WhatsApp Business Cloud API. Lives on the same Meta app as
+	// Facebook / Instagram (FB_APP_ID + FB_APP_SECRET), so we don't
+	// duplicate those — only the per-product OAuth callback differs.
+	//
+	//   • WAOAuthRedirectURI — must match an entry in the Meta app's
+	//     "Facebook Login → Valid OAuth Redirect URIs" allow-list.
+	//     Typically `${BACKEND_PUBLIC_URL}/webhooks/whatsapp/oauth/callback`.
+	WAOAuthRedirectURI string
+
+	// Lazada Open Platform. App credentials are issued at
+	// https://open.lazada.com → My Apps → your app.
+	//
+	//   • LZAppKey + LZAppSecret — used for OAuth, request signing, and
+	//     webhook signature verification.
+	//   • LZOAuthRedirectURI — must match the redirect URI registered on
+	//     the Lazada app dashboard. Typically
+	//     `${BACKEND_PUBLIC_URL}/webhooks/lazada/oauth/callback`.
+	LZAppKey           string
+	LZAppSecret        string
+	LZOAuthRedirectURI string
+
 	// FrontendBaseURL — used to build the post-OAuth redirect that brings
 	// the user back to the dashboard's channels page. Typically the same
 	// origin as AcceptInviteBaseURL minus the path.
@@ -128,6 +165,17 @@ func Load() (*Config, error) {
 		FBVerifyToken:      getEnv("FB_VERIFY_TOKEN", ""),
 		FBOAuthRedirectURI: getEnv("FB_OAUTH_REDIRECT_URI", "http://localhost:8080/webhooks/facebook/oauth/callback"),
 		IGOAuthRedirectURI: getEnv("IG_OAUTH_REDIRECT_URI", "http://localhost:8080/webhooks/instagram/oauth/callback"),
+
+		TTClientKey:        getEnv("TT_CLIENT_KEY", ""),
+		TTClientSecret:     getEnv("TT_CLIENT_SECRET", ""),
+		TTVerifyToken:      getEnv("TT_VERIFY_TOKEN", ""),
+		TTOAuthRedirectURI: getEnv("TT_OAUTH_REDIRECT_URI", "http://localhost:8080/webhooks/tiktok/oauth/callback"),
+
+		WAOAuthRedirectURI: getEnv("WA_OAUTH_REDIRECT_URI", "http://localhost:8080/webhooks/whatsapp/oauth/callback"),
+
+		LZAppKey:           getEnv("LZ_APP_KEY", ""),
+		LZAppSecret:        getEnv("LZ_APP_SECRET", ""),
+		LZOAuthRedirectURI: getEnv("LZ_OAUTH_REDIRECT_URI", "http://localhost:8080/webhooks/lazada/oauth/callback"),
 
 		FrontendBaseURL:  getEnv("FRONTEND_BASE_URL", "http://localhost:3000"),
 		BackendPublicURL: getEnv("BACKEND_PUBLIC_URL", "http://localhost:8080"),

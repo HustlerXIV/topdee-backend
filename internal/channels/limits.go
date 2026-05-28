@@ -13,6 +13,9 @@ type PlanLimit struct {
 	Facebook  int
 	Instagram int
 	Line      int
+	TikTok    int
+	WhatsApp  int
+	Lazada    int
 	Web       int
 }
 
@@ -90,6 +93,9 @@ func PolicyForCtx(ctx context.Context, db *mongo.Database, plan string) ChannelP
 			"facebook":  pl.Facebook,
 			"instagram": pl.Instagram,
 			"line":      pl.Line,
+			"tiktok":    pl.TikTok,
+			"whatsapp":  pl.WhatsApp,
+			"lazada":    pl.Lazada,
 			"web":       pl.Web,
 		},
 	}
@@ -148,6 +154,12 @@ func limitFallback(plan, provider string) int {
 		return pl.Instagram
 	case "line":
 		return pl.Line
+	case "tiktok":
+		return pl.TikTok
+	case "whatsapp":
+		return pl.WhatsApp
+	case "lazada":
+		return pl.Lazada
 	case "web":
 		return pl.Web
 	}
@@ -157,13 +169,13 @@ func limitFallback(plan, provider string) int {
 // hardcodedLimits are bootstrap values used before the plans collection is
 // seeded, and as the ultimate fallback.
 var hardcodedLimits = map[string]PlanLimit{
-	"free":       {Facebook: 1, Instagram: 1, Line: 1, Web: 1},
-	"starter":    {Facebook: 1, Instagram: 1, Line: 1, Web: 1},
-	"basic":      {Facebook: 3, Instagram: 3, Line: 1, Web: 3},
-	"growth":     {Facebook: 5, Instagram: 5, Line: 3, Web: 5},
-	"pro":        {Facebook: 10, Instagram: 10, Line: 5, Web: 10},
-	"enterprise": {Facebook: 100, Instagram: 100, Line: 100, Web: 100},
-	"default":    {Facebook: 1, Instagram: 1, Line: 1, Web: 1},
+	"free":       {Facebook: 1, Instagram: 1, Line: 1, TikTok: 1, WhatsApp: 1, Lazada: 1, Web: 1},
+	"starter":    {Facebook: 1, Instagram: 1, Line: 1, TikTok: 1, WhatsApp: 1, Lazada: 1, Web: 1},
+	"basic":      {Facebook: 3, Instagram: 3, Line: 1, TikTok: 1, WhatsApp: 1, Lazada: 1, Web: 3},
+	"growth":     {Facebook: 5, Instagram: 5, Line: 3, TikTok: 3, WhatsApp: 3, Lazada: 3, Web: 5},
+	"pro":        {Facebook: 10, Instagram: 10, Line: 5, TikTok: 5, WhatsApp: 5, Lazada: 5, Web: 10},
+	"enterprise": {Facebook: 100, Instagram: 100, Line: 100, TikTok: 100, WhatsApp: 100, Lazada: 100, Web: 100},
+	"default":    {Facebook: 1, Instagram: 1, Line: 1, TikTok: 1, WhatsApp: 1, Lazada: 1, Web: 1},
 }
 
 // LimitsForPlan returns the full hardcoded table for one plan.

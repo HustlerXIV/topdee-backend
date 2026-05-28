@@ -55,6 +55,9 @@ func main() {
 	channelRegistry.Register(channels.NewFacebookProvider())
 	channelRegistry.Register(channels.NewInstagramProvider())
 	channelRegistry.Register(channels.NewLineProvider())
+	channelRegistry.Register(channels.NewTikTokProvider())
+	channelRegistry.Register(channels.NewWhatsAppProvider())
+	channelRegistry.Register(channels.NewLazadaProvider())
 	channelStore := channels.NewStore(mongo)
 
 	// One-time migration: copy any legacy tenants.facebook / tenants.line
@@ -194,6 +197,16 @@ func main() {
 	protected.Post("/channels/instagram/oauth/start", chH.InstagramOAuthStart)
 	protected.Get("/channels/instagram/oauth/accounts", chH.InstagramOAuthAccounts)
 	protected.Post("/channels/instagram/oauth/connect", chH.InstagramOAuthConnect)
+	// TikTok: OAuth login flow → account picker → connect selected TikTok Business Accounts.
+	protected.Post("/channels/tiktok/oauth/start", chH.TikTokOAuthStart)
+	protected.Get("/channels/tiktok/oauth/accounts", chH.TikTokOAuthAccounts)
+	protected.Post("/channels/tiktok/oauth/connect", chH.TikTokOAuthConnect)
+	// WhatsApp: Meta Login (Embedded Signup) → phone-number picker → connect.
+	protected.Post("/channels/whatsapp/oauth/start", chH.WhatsAppOAuthStart)
+	protected.Get("/channels/whatsapp/oauth/phone-numbers", chH.WhatsAppOAuthPhoneNumbers)
+	protected.Post("/channels/whatsapp/oauth/connect", chH.WhatsAppOAuthConnect)
+	// Lazada: OAuth → callback finishes the connection (single seller, no picker).
+	protected.Post("/channels/lazada/oauth/start", chH.LazadaOAuthStart)
 
 	// Web widget — creates a connection + returns the embed code.
 	protected.Post("/channels/web", chH.ConnectWeb)
@@ -269,6 +282,9 @@ func main() {
 	webhooks := app.Group("/webhooks")
 	webhooks.Get("/facebook/oauth/callback", handlers.FacebookOAuthCallback(channelStore, mongo, cfg))
 	webhooks.Get("/instagram/oauth/callback", handlers.InstagramOAuthCallback(channelStore, mongo, cfg))
+	webhooks.Get("/tiktok/oauth/callback", handlers.TikTokOAuthCallback(channelStore, mongo, cfg))
+	webhooks.Get("/whatsapp/oauth/callback", handlers.WhatsAppOAuthCallback(channelStore, mongo, cfg))
+	webhooks.Get("/lazada/oauth/callback", handlers.LazadaOAuthCallback(channelStore, mongo, cfg))
 	webhooks.Post("/stripe", handlers.StripeWebhook(mongo, cfg))
 	// Generic provider webhooks. Two URL shapes are supported:
 	//   /webhooks/<provider>                 — uses the body to find the

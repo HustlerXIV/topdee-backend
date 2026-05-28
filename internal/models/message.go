@@ -13,6 +13,9 @@ const (
 	ChannelDashboard = "dashboard"
 	ChannelFacebook  = "facebook"
 	ChannelLine      = "line"
+	ChannelTikTok    = "tiktok"
+	ChannelWhatsApp  = "whatsapp"
+	ChannelLazada    = "lazada"
 	ChannelWeb       = "web"
 )
 

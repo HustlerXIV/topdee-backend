@@ -8,6 +8,9 @@ const (
 	ProviderFacebook  = "facebook"
 	ProviderInstagram = "instagram"
 	ProviderLine      = "line"
+	ProviderTikTok    = "tiktok"
+	ProviderWhatsApp  = "whatsapp"
+	ProviderLazada    = "lazada"
 	ProviderWeb       = "web"
 )
 
@@ -107,4 +110,74 @@ type InstagramOAuthAccount struct {
 	Username        string `bson:"username,omitempty" json:"username,omitempty"`
 	PageID          string `bson:"page_id" json:"page_id"`
 	PageAccessToken string `bson:"page_access_token" json:"-"`
+}
+
+// TikTokOAuthState — mirrors FacebookOAuthState but for TikTok Login Kit.
+// After the OAuth callback we list the TikTok business accounts the user
+// can manage and stash them here for the picker step.
+type TikTokOAuthState struct {
+	State            string               `bson:"_id" json:"state"`
+	TenantID         string               `bson:"tenant_id" json:"tenant_id"`
+	UserID           string               `bson:"user_id" json:"user_id"`
+	OpenID           string               `bson:"open_id" json:"-"`
+	AccessToken      string               `bson:"access_token" json:"-"`
+	RefreshToken     string               `bson:"refresh_token" json:"-"`
+	ExpiresIn        int                  `bson:"expires_in" json:"-"`
+	RefreshExpiresIn int                  `bson:"refresh_expires_in" json:"-"`
+	Accounts         []TikTokOAuthAccount `bson:"accounts" json:"accounts"`
+	CreatedAt        time.Time            `bson:"created_at" json:"created_at"`
+	ExpiresAt        time.Time            `bson:"expires_at" json:"expires_at"`
+}
+
+// TikTokOAuthAccount — one entry in the account picker. The access + refresh
+// tokens that get baked into the persisted connection live on the parent
+// TikTokOAuthState, since they're identical across the user's accounts.
+type TikTokOAuthAccount struct {
+	// BusinessID is the TikTok Business Account ID (or open_id when no
+	// Business Center entry exists). Used as the connection's external_id.
+	BusinessID  string `bson:"business_id" json:"business_id"`
+	DisplayName string `bson:"display_name" json:"display_name"`
+	Username    string `bson:"username,omitempty" json:"username,omitempty"`
+}
+
+// WhatsAppOAuthState — mirrors FacebookOAuthState but for WhatsApp Cloud
+// API. After the OAuth callback we list the WhatsApp Business Accounts
+// (WABAs) and their phone numbers, then let the user pick which numbers
+// to connect.
+type WhatsAppOAuthState struct {
+	State           string                    `bson:"_id" json:"state"`
+	TenantID        string                    `bson:"tenant_id" json:"tenant_id"`
+	UserID          string                    `bson:"user_id" json:"user_id"`
+	UserAccessToken string                    `bson:"user_access_token" json:"-"`
+	PhoneNumbers    []WhatsAppOAuthPhoneNumber `bson:"phone_numbers" json:"phone_numbers"`
+	CreatedAt       time.Time                 `bson:"created_at" json:"created_at"`
+	ExpiresAt       time.Time                 `bson:"expires_at" json:"expires_at"`
+}
+
+// WhatsAppOAuthPhoneNumber — one entry in the phone-number picker. The
+// access_token used at send time comes from the parent state (Meta issues
+// one user token that's valid against every WABA the user owns).
+type WhatsAppOAuthPhoneNumber struct {
+	// PhoneNumberID is Meta's id for this number — the value the Cloud
+	// API addresses when sending (`POST /{phone-number-id}/messages`).
+	// Used as the connection's external_id.
+	PhoneNumberID      string `bson:"phone_number_id" json:"phone_number_id"`
+	DisplayPhoneNumber string `bson:"display_phone_number" json:"display_phone_number"`
+	VerifiedName       string `bson:"verified_name,omitempty" json:"verified_name,omitempty"`
+	QualityRating      string `bson:"quality_rating,omitempty" json:"quality_rating,omitempty"`
+	WABAID             string `bson:"waba_id" json:"waba_id"`
+	WABAName           string `bson:"waba_name,omitempty" json:"waba_name,omitempty"`
+	BusinessID         string `bson:"business_id,omitempty" json:"business_id,omitempty"`
+}
+
+// LazadaOAuthState — in-flight Lazada OAuth handshake. Lazada's OAuth
+// binds to a single seller account so there is no "picker" step; we still
+// persist the state-only document at start so /webhooks/lazada/oauth/callback
+// can prove the dance was initiated by this tenant.
+type LazadaOAuthState struct {
+	State     string    `bson:"_id" json:"state"`
+	TenantID  string    `bson:"tenant_id" json:"tenant_id"`
+	UserID    string    `bson:"user_id" json:"user_id"`
+	CreatedAt time.Time `bson:"created_at" json:"created_at"`
+	ExpiresAt time.Time `bson:"expires_at" json:"expires_at"`
 }

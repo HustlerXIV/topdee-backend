@@ -152,6 +152,9 @@ func (h *ChannelsHandler) List(c *fiber.Ctx) error {
 		models.ProviderFacebook,
 		models.ProviderInstagram,
 		models.ProviderLine,
+		models.ProviderTikTok,
+		models.ProviderWhatsApp,
+		models.ProviderLazada,
 		models.ProviderWeb,
 	}
 	for provider, cap := range policy.ProviderCaps {
@@ -715,6 +718,393 @@ func (h *ChannelsHandler) InstagramOAuthConnect(c *fiber.Ctx) error {
 // don't need to import the uuid package.
 func newUUID() string {
 	return uuid.NewString()
+}
+
+// ── TikTok OAuth flow ──────────────────────────────────────────────────
+
+// POST /api/v1/channels/tiktok/oauth/start
+//
+// Generates a state token, stamps it with this tenant + user, and returns
+// the TikTok Login URL. Frontend redirects the browser to that URL; TikTok
+// later GETs /webhooks/tiktok/oauth/callback (no auth) where we finish the
+// dance and stash the result keyed by state.
+func (h *ChannelsHandler) TikTokOAuthStart(c *fiber.Ctx) error {
+	if h.cfg.TTClientKey == "" || h.cfg.TTClientSecret == "" {
+		return fiber.NewError(
+			fiber.StatusFailedDependency,
+			"TikTok Login is not configured on this server (set TT_CLIENT_KEY / TT_CLIENT_SECRET)",
+		)
+	}
+	tid := middleware.TenantID(c)
+	uid := middleware.UserID(c)
+
+	state := newUUID()
+	st := &models.TikTokOAuthState{
+		State:    state,
+		TenantID: tid,
+		UserID:   uid,
+	}
+	if err := h.store.SaveTTOAuthState(c.Context(), st); err != nil {
+		return err
+	}
+	return c.JSON(fiber.Map{
+		"login_url": channels.TikTokLoginURL(h.cfg, state),
+		"state":     state,
+	})
+}
+
+// GET /api/v1/channels/tiktok/oauth/accounts?state=...
+//
+// Returns the list of TikTok business accounts the user can connect — without
+// their access tokens (those stay server-side, indexed by state).
+func (h *ChannelsHandler) TikTokOAuthAccounts(c *fiber.Ctx) error {
+	tid := middleware.TenantID(c)
+	uid := middleware.UserID(c)
+	state := c.Query("state")
+	if state == "" {
+		return fiber.NewError(fiber.StatusBadRequest, "missing state")
+	}
+
+	st, err := h.store.GetTTOAuthState(c.Context(), state)
+	if err != nil {
+		return err
+	}
+	if st == nil {
+		return fiber.NewError(fiber.StatusGone, "OAuth state expired")
+	}
+	if st.TenantID != tid || st.UserID != uid {
+		return fiber.NewError(fiber.StatusForbidden, "this OAuth state belongs to another user")
+	}
+
+	type accountView struct {
+		BusinessID  string `json:"business_id"`
+		DisplayName string `json:"display_name"`
+		Username    string `json:"username,omitempty"`
+	}
+	out := make([]accountView, 0, len(st.Accounts))
+	for _, a := range st.Accounts {
+		out = append(out, accountView{
+			BusinessID:  a.BusinessID,
+			DisplayName: a.DisplayName,
+			Username:    a.Username,
+		})
+	}
+	return c.JSON(fiber.Map{
+		"accounts": out,
+		"state":    state,
+	})
+}
+
+// POST /api/v1/channels/tiktok/oauth/connect
+//
+// User picked which TikTok accounts to connect; persist them as connections.
+// All accounts under one OAuth handshake share the same access/refresh token
+// pair, so we copy them to each connection's Credentials map.
+type tiktokConnectReq struct {
+	State       string   `json:"state"`
+	BusinessIDs []string `json:"business_ids"`
+}
+
+func (h *ChannelsHandler) TikTokOAuthConnect(c *fiber.Ctx) error {
+	tid := middleware.TenantID(c)
+	uid := middleware.UserID(c)
+
+	var req tiktokConnectReq
+	if err := c.BodyParser(&req); err != nil || req.State == "" || len(req.BusinessIDs) == 0 {
+		return fiber.NewError(fiber.StatusBadRequest, "state and business_ids required")
+	}
+
+	st, err := h.store.GetTTOAuthState(c.Context(), req.State)
+	if err != nil {
+		return err
+	}
+	if st == nil {
+		return fiber.NewError(fiber.StatusGone, "OAuth state expired")
+	}
+	if st.TenantID != tid || st.UserID != uid {
+		return fiber.NewError(fiber.StatusForbidden, "this OAuth state belongs to another user")
+	}
+
+	// Index discovered accounts by business_id for quick lookup.
+	byID := map[string]models.TikTokOAuthAccount{}
+	for _, a := range st.Accounts {
+		byID[a.BusinessID] = a
+	}
+
+	// Pre-flight plan limit check — branches on per-provider vs total mode.
+	if err := h.enforceLimitWithAdd(c, tid, models.ProviderTikTok, req.BusinessIDs); err != nil {
+		return err
+	}
+
+	// Stamp credentials with absolute expiry so the refresh helper can do
+	// time math without re-deriving from expires_in.
+	now := time.Now()
+	accessExp := ""
+	if st.ExpiresIn > 0 {
+		accessExp = now.Add(time.Duration(st.ExpiresIn) * time.Second).UTC().Format(time.RFC3339)
+	}
+	refreshExp := ""
+	if st.RefreshExpiresIn > 0 {
+		refreshExp = now.Add(time.Duration(st.RefreshExpiresIn) * time.Second).UTC().Format(time.RFC3339)
+	}
+
+	connected := []connectionView{}
+	for _, bid := range req.BusinessIDs {
+		acct, ok := byID[bid]
+		if !ok {
+			return fiber.NewError(fiber.StatusBadRequest, "account "+bid+" not in this OAuth session")
+		}
+		displayName := acct.DisplayName
+		if acct.Username != "" {
+			displayName = "@" + acct.Username
+		}
+		creds := map[string]string{
+			"access_token":             st.AccessToken,
+			"refresh_token":            st.RefreshToken,
+			"access_token_expires_at":  accessExp,
+			"refresh_token_expires_at": refreshExp,
+			"open_id":                  st.OpenID,
+			"business_id":              acct.BusinessID,
+			"client_key":               h.cfg.TTClientKey,
+			"client_secret":            h.cfg.TTClientSecret,
+		}
+		conn := &models.ChannelConnection{
+			TenantID:    tid,
+			Provider:    models.ProviderTikTok,
+			ExternalID:  acct.BusinessID,
+			DisplayName: displayName,
+			Credentials: creds,
+			Status:      models.ChannelStatusActive,
+			CreatedBy:   uid,
+		}
+		if err := h.store.Upsert(c.Context(), conn); err != nil {
+			if errors.Is(err, channels.ErrConnectionTaken) {
+				return fiber.NewError(fiber.StatusConflict,
+					"\""+displayName+"\" is already connected to another workspace")
+			}
+			return err
+		}
+		connected = append(connected, h.toView(conn))
+	}
+
+	// Done with the state — kill it so the same handshake can't be replayed.
+	_ = h.store.DeleteTTOAuthState(c.Context(), req.State)
+
+	return c.JSON(fiber.Map{"connections": connected})
+}
+
+// ── WhatsApp OAuth flow ────────────────────────────────────────────────
+
+// POST /api/v1/channels/whatsapp/oauth/start
+//
+// Same pattern as Facebook — generates a state token and returns the Meta
+// Login URL with WhatsApp-specific scopes. After the user authorizes, Meta
+// redirects to /webhooks/whatsapp/oauth/callback which discovers the
+// user's WABAs + phone numbers and bounces back here with the picker.
+func (h *ChannelsHandler) WhatsAppOAuthStart(c *fiber.Ctx) error {
+	if h.cfg.FBAppID == "" || h.cfg.FBAppSecret == "" {
+		return fiber.NewError(
+			fiber.StatusFailedDependency,
+			"WhatsApp Login is not configured on this server (set FB_APP_ID / FB_APP_SECRET)",
+		)
+	}
+	tid := middleware.TenantID(c)
+	uid := middleware.UserID(c)
+
+	state := newUUID()
+	st := &models.WhatsAppOAuthState{
+		State:    state,
+		TenantID: tid,
+		UserID:   uid,
+	}
+	if err := h.store.SaveWAOAuthState(c.Context(), st); err != nil {
+		return err
+	}
+	return c.JSON(fiber.Map{
+		"login_url": channels.WhatsAppLoginURL(h.cfg, state),
+		"state":     state,
+	})
+}
+
+// GET /api/v1/channels/whatsapp/oauth/phone-numbers?state=...
+//
+// Returns the list of WhatsApp phone numbers discovered during the OAuth
+// dance — without the user-access token.
+func (h *ChannelsHandler) WhatsAppOAuthPhoneNumbers(c *fiber.Ctx) error {
+	tid := middleware.TenantID(c)
+	uid := middleware.UserID(c)
+	state := c.Query("state")
+	if state == "" {
+		return fiber.NewError(fiber.StatusBadRequest, "missing state")
+	}
+
+	st, err := h.store.GetWAOAuthState(c.Context(), state)
+	if err != nil {
+		return err
+	}
+	if st == nil {
+		return fiber.NewError(fiber.StatusGone, "OAuth state expired")
+	}
+	if st.TenantID != tid || st.UserID != uid {
+		return fiber.NewError(fiber.StatusForbidden, "this OAuth state belongs to another user")
+	}
+
+	type pnView struct {
+		PhoneNumberID      string `json:"phone_number_id"`
+		DisplayPhoneNumber string `json:"display_phone_number"`
+		VerifiedName       string `json:"verified_name,omitempty"`
+		QualityRating      string `json:"quality_rating,omitempty"`
+		WABAID             string `json:"waba_id"`
+		WABAName           string `json:"waba_name,omitempty"`
+	}
+	out := make([]pnView, 0, len(st.PhoneNumbers))
+	for _, n := range st.PhoneNumbers {
+		out = append(out, pnView{
+			PhoneNumberID:      n.PhoneNumberID,
+			DisplayPhoneNumber: n.DisplayPhoneNumber,
+			VerifiedName:       n.VerifiedName,
+			QualityRating:      n.QualityRating,
+			WABAID:             n.WABAID,
+			WABAName:           n.WABAName,
+		})
+	}
+	return c.JSON(fiber.Map{
+		"phone_numbers": out,
+		"state":         state,
+	})
+}
+
+// POST /api/v1/channels/whatsapp/oauth/connect
+//
+// User picked which phone numbers to connect; persist them.
+type waConnectReq struct {
+	State          string   `json:"state"`
+	PhoneNumberIDs []string `json:"phone_number_ids"`
+}
+
+func (h *ChannelsHandler) WhatsAppOAuthConnect(c *fiber.Ctx) error {
+	tid := middleware.TenantID(c)
+	uid := middleware.UserID(c)
+
+	var req waConnectReq
+	if err := c.BodyParser(&req); err != nil || req.State == "" || len(req.PhoneNumberIDs) == 0 {
+		return fiber.NewError(fiber.StatusBadRequest, "state and phone_number_ids required")
+	}
+
+	st, err := h.store.GetWAOAuthState(c.Context(), req.State)
+	if err != nil {
+		return err
+	}
+	if st == nil {
+		return fiber.NewError(fiber.StatusGone, "OAuth state expired")
+	}
+	if st.TenantID != tid || st.UserID != uid {
+		return fiber.NewError(fiber.StatusForbidden, "this OAuth state belongs to another user")
+	}
+
+	// Index by PhoneNumberID for fast lookup. We also remember which WABA
+	// each number belongs to so we only call SubscribeWABA once per WABA.
+	byID := map[string]models.WhatsAppOAuthPhoneNumber{}
+	for _, n := range st.PhoneNumbers {
+		byID[n.PhoneNumberID] = n
+	}
+
+	// Pre-flight plan limit check.
+	if err := h.enforceLimitWithAdd(c, tid, models.ProviderWhatsApp, req.PhoneNumberIDs); err != nil {
+		return err
+	}
+
+	subscribed := map[string]bool{}
+	connected := []connectionView{}
+	for _, pnid := range req.PhoneNumberIDs {
+		n, ok := byID[pnid]
+		if !ok {
+			return fiber.NewError(fiber.StatusBadRequest, "phone number "+pnid+" not in this OAuth session")
+		}
+		displayName := n.VerifiedName
+		if displayName == "" {
+			displayName = n.DisplayPhoneNumber
+		}
+		if displayName == "" {
+			displayName = n.PhoneNumberID
+		}
+		conn := &models.ChannelConnection{
+			TenantID:    tid,
+			Provider:    models.ProviderWhatsApp,
+			ExternalID:  n.PhoneNumberID,
+			DisplayName: displayName,
+			Credentials: map[string]string{
+				"access_token":         st.UserAccessToken,
+				"phone_number_id":      n.PhoneNumberID,
+				"waba_id":              n.WABAID,
+				"display_phone_number": n.DisplayPhoneNumber,
+			},
+			Config: map[string]any{
+				"waba_name":      n.WABAName,
+				"quality_rating": n.QualityRating,
+				"business_id":    n.BusinessID,
+			},
+			Status:    models.ChannelStatusActive,
+			CreatedBy: uid,
+		}
+		if err := h.store.Upsert(c.Context(), conn); err != nil {
+			if errors.Is(err, channels.ErrConnectionTaken) {
+				return fiber.NewError(fiber.StatusConflict,
+					"\""+displayName+"\" is already connected to another workspace")
+			}
+			return err
+		}
+		// Subscribe the app to this WABA's webhooks (once per WABA).
+		if !subscribed[n.WABAID] && n.WABAID != "" {
+			if err := channels.WhatsAppSubscribeWABA(c.Context(), st.UserAccessToken, n.WABAID); err != nil {
+				_ = h.store.MarkError(c.Context(), conn.ID, "subscribe failed: "+err.Error())
+			}
+			subscribed[n.WABAID] = true
+		}
+		connected = append(connected, h.toView(conn))
+	}
+
+	_ = h.store.DeleteWAOAuthState(c.Context(), req.State)
+	return c.JSON(fiber.Map{"connections": connected})
+}
+
+// ── Lazada OAuth flow ──────────────────────────────────────────────────
+//
+// Lazada binds the OAuth dance to a single seller account — there's no
+// picker step. We persist the state-only doc up front, then the callback
+// finishes the connection directly and bounces back to the dashboard.
+
+// POST /api/v1/channels/lazada/oauth/start
+func (h *ChannelsHandler) LazadaOAuthStart(c *fiber.Ctx) error {
+	if h.cfg.LZAppKey == "" || h.cfg.LZAppSecret == "" {
+		return fiber.NewError(
+			fiber.StatusFailedDependency,
+			"Lazada Login is not configured on this server (set LZ_APP_KEY / LZ_APP_SECRET)",
+		)
+	}
+	tid := middleware.TenantID(c)
+	uid := middleware.UserID(c)
+
+	// Plan limit pre-check — Lazada has no picker so we can't enforce on
+	// the connect step; do it here instead. addCount=1 represents the
+	// single seller account the user is about to connect.
+	if err := h.enforceLimit(c, tid, models.ProviderLazada, ""); err != nil {
+		return err
+	}
+
+	state := newUUID()
+	st := &models.LazadaOAuthState{
+		State:    state,
+		TenantID: tid,
+		UserID:   uid,
+	}
+	if err := h.store.SaveLZOAuthState(c.Context(), st); err != nil {
+		return err
+	}
+	return c.JSON(fiber.Map{
+		"login_url": channels.LazadaLoginURL(h.cfg, state),
+		"state":     state,
+	})
 }
 
 // ── POST /api/v1/channels/web ──────────────────────────────────────────────

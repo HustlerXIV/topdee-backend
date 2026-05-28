@@ -338,3 +338,144 @@ func (s *Store) DeleteIGOAuthState(ctx context.Context, state string) error {
 	_, err := s.mongo.DB.Collection(igOAuthStatesColl).DeleteOne(ctx, bson.M{"_id": state})
 	return err
 }
+
+// ── TikTok OAuth state helpers ──────────────────────────────────────────
+//
+// Stored in a separate collection ("channel_tt_oauth_states") so the bson
+// shape doesn't collide with Facebook / Instagram state documents.
+
+const ttOAuthStatesColl = "channel_tt_oauth_states"
+
+// SaveTTOAuthState persists an in-flight TikTok OAuth handshake.
+func (s *Store) SaveTTOAuthState(ctx context.Context, st *models.TikTokOAuthState) error {
+	if st.CreatedAt.IsZero() {
+		st.CreatedAt = time.Now().UTC()
+	}
+	if st.ExpiresAt.IsZero() {
+		st.ExpiresAt = time.Now().Add(15 * time.Minute).UTC()
+	}
+	_, err := s.mongo.DB.Collection(ttOAuthStatesColl).UpdateOne(
+		ctx,
+		bson.M{"_id": st.State},
+		bson.M{"$set": st},
+		options.Update().SetUpsert(true),
+	)
+	return err
+}
+
+// GetTTOAuthState fetches a pending TikTok OAuth handshake.
+// Returns nil when missing or expired.
+func (s *Store) GetTTOAuthState(ctx context.Context, state string) (*models.TikTokOAuthState, error) {
+	var st models.TikTokOAuthState
+	err := s.mongo.DB.Collection(ttOAuthStatesColl).FindOne(ctx, bson.M{"_id": state}).Decode(&st)
+	if err == mongo.ErrNoDocuments {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if !st.ExpiresAt.IsZero() && time.Now().After(st.ExpiresAt) {
+		return nil, nil
+	}
+	return &st, nil
+}
+
+// DeleteTTOAuthState removes the state record after use.
+func (s *Store) DeleteTTOAuthState(ctx context.Context, state string) error {
+	_, err := s.mongo.DB.Collection(ttOAuthStatesColl).DeleteOne(ctx, bson.M{"_id": state})
+	return err
+}
+
+// ── WhatsApp OAuth state helpers ────────────────────────────────────────
+//
+// Stored in a separate collection ("channel_wa_oauth_states") so the bson
+// shape doesn't collide with Facebook / Instagram / TikTok state docs.
+
+const waOAuthStatesColl = "channel_wa_oauth_states"
+
+// SaveWAOAuthState persists an in-flight WhatsApp OAuth handshake.
+func (s *Store) SaveWAOAuthState(ctx context.Context, st *models.WhatsAppOAuthState) error {
+	if st.CreatedAt.IsZero() {
+		st.CreatedAt = time.Now().UTC()
+	}
+	if st.ExpiresAt.IsZero() {
+		st.ExpiresAt = time.Now().Add(15 * time.Minute).UTC()
+	}
+	_, err := s.mongo.DB.Collection(waOAuthStatesColl).UpdateOne(
+		ctx,
+		bson.M{"_id": st.State},
+		bson.M{"$set": st},
+		options.Update().SetUpsert(true),
+	)
+	return err
+}
+
+// GetWAOAuthState fetches a pending WhatsApp OAuth handshake.
+// Returns nil when missing or expired.
+func (s *Store) GetWAOAuthState(ctx context.Context, state string) (*models.WhatsAppOAuthState, error) {
+	var st models.WhatsAppOAuthState
+	err := s.mongo.DB.Collection(waOAuthStatesColl).FindOne(ctx, bson.M{"_id": state}).Decode(&st)
+	if err == mongo.ErrNoDocuments {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if !st.ExpiresAt.IsZero() && time.Now().After(st.ExpiresAt) {
+		return nil, nil
+	}
+	return &st, nil
+}
+
+// DeleteWAOAuthState removes the state record after use.
+func (s *Store) DeleteWAOAuthState(ctx context.Context, state string) error {
+	_, err := s.mongo.DB.Collection(waOAuthStatesColl).DeleteOne(ctx, bson.M{"_id": state})
+	return err
+}
+
+// ── Lazada OAuth state helpers ──────────────────────────────────────────
+//
+// Lazada's OAuth dance produces a single seller binding (no picker step),
+// so we only need the state doc to prove this tenant initiated the dance.
+
+const lzOAuthStatesColl = "channel_lz_oauth_states"
+
+// SaveLZOAuthState persists an in-flight Lazada OAuth handshake.
+func (s *Store) SaveLZOAuthState(ctx context.Context, st *models.LazadaOAuthState) error {
+	if st.CreatedAt.IsZero() {
+		st.CreatedAt = time.Now().UTC()
+	}
+	if st.ExpiresAt.IsZero() {
+		st.ExpiresAt = time.Now().Add(15 * time.Minute).UTC()
+	}
+	_, err := s.mongo.DB.Collection(lzOAuthStatesColl).UpdateOne(
+		ctx,
+		bson.M{"_id": st.State},
+		bson.M{"$set": st},
+		options.Update().SetUpsert(true),
+	)
+	return err
+}
+
+// GetLZOAuthState fetches a pending Lazada OAuth handshake.
+// Returns nil when missing or expired.
+func (s *Store) GetLZOAuthState(ctx context.Context, state string) (*models.LazadaOAuthState, error) {
+	var st models.LazadaOAuthState
+	err := s.mongo.DB.Collection(lzOAuthStatesColl).FindOne(ctx, bson.M{"_id": state}).Decode(&st)
+	if err == mongo.ErrNoDocuments {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if !st.ExpiresAt.IsZero() && time.Now().After(st.ExpiresAt) {
+		return nil, nil
+	}
+	return &st, nil
+}
+
+// DeleteLZOAuthState removes the state record after use.
+func (s *Store) DeleteLZOAuthState(ctx context.Context, state string) error {
+	_, err := s.mongo.DB.Collection(lzOAuthStatesColl).DeleteOne(ctx, bson.M{"_id": state})
+	return err
+}

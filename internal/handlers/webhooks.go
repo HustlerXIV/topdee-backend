@@ -375,6 +375,228 @@ func InstagramOAuthCallback(store *channels.Store, m *db.Mongo, cfg *config.Conf
 	}
 }
 
+// ── TikTok OAuth callback ──────────────────────────────────────────────
+//
+// Mirrors FacebookOAuthCallback. TikTok redirects here with ?code & ?state
+// after the user authorizes the app. We exchange the code for an
+// access/refresh token pair, discover the business accounts the user can
+// manage, persist them on the state record, and bounce the browser back
+// to the dashboard account picker.
+
+func TikTokOAuthCallback(store *channels.Store, m *db.Mongo, cfg *config.Config) fiber.Handler {
+	return func(c *fiber.Ctx) error {
+		state := c.Query("state")
+		code := c.Query("code")
+		errMsg := firstNonEmpty(c.Query("error_description"), c.Query("error"))
+
+		if state == "" {
+			return fiber.NewError(fiber.StatusBadRequest, "missing state")
+		}
+
+		st, err := store.GetTTOAuthState(c.Context(), state)
+		if err != nil {
+			return err
+		}
+		if st == nil {
+			return fiber.NewError(fiber.StatusBadRequest, "invalid or expired state")
+		}
+
+		if code == "" {
+			_ = store.DeleteTTOAuthState(c.Context(), state)
+			redirectTo := cfg.FrontendBaseURL + "/channels?tt_oauth=error&reason=" +
+				url.QueryEscape(firstNonEmpty(errMsg, "no code returned"))
+			return c.Redirect(redirectTo, fiber.StatusFound)
+		}
+
+		tok, err := channels.TikTokExchangeCode(c.Context(), cfg, code)
+		if err != nil {
+			log.Printf("tt oauth: exchange: %v", err)
+			_ = store.DeleteTTOAuthState(c.Context(), state)
+			return c.Redirect(cfg.FrontendBaseURL+"/channels?tt_oauth=error&reason=exchange_failed", fiber.StatusFound)
+		}
+
+		accounts, err := channels.TikTokListAccounts(c.Context(), tok.AccessToken, tok.OpenID)
+		if err != nil {
+			log.Printf("tt oauth: list accounts: %v", err)
+			_ = store.DeleteTTOAuthState(c.Context(), state)
+			return c.Redirect(cfg.FrontendBaseURL+"/channels?tt_oauth=error&reason=list_accounts_failed", fiber.StatusFound)
+		}
+
+		st.AccessToken = tok.AccessToken
+		st.RefreshToken = tok.RefreshToken
+		st.OpenID = tok.OpenID
+		st.ExpiresIn = tok.ExpiresIn
+		st.RefreshExpiresIn = tok.RefreshExpiresIn
+		st.Accounts = accounts
+		if err := store.SaveTTOAuthState(c.Context(), st); err != nil {
+			log.Printf("tt oauth: save state: %v", err)
+		}
+
+		return c.Redirect(cfg.FrontendBaseURL+"/channels?tt_oauth=ok&state="+url.QueryEscape(state), fiber.StatusFound)
+	}
+}
+
+// ── WhatsApp OAuth callback ────────────────────────────────────────────
+//
+// Mirrors FacebookOAuthCallback. After Meta redirects back here, we
+// exchange the code for a long-lived user token, discover the WhatsApp
+// Business Accounts + phone numbers, persist them on the state record,
+// and bounce the browser back to the dashboard picker.
+
+func WhatsAppOAuthCallback(store *channels.Store, m *db.Mongo, cfg *config.Config) fiber.Handler {
+	return func(c *fiber.Ctx) error {
+		state := c.Query("state")
+		code := c.Query("code")
+		errMsg := c.Query("error_description")
+
+		if state == "" {
+			return fiber.NewError(fiber.StatusBadRequest, "missing state")
+		}
+
+		st, err := store.GetWAOAuthState(c.Context(), state)
+		if err != nil {
+			return err
+		}
+		if st == nil {
+			return fiber.NewError(fiber.StatusBadRequest, "invalid or expired state")
+		}
+
+		if code == "" {
+			_ = store.DeleteWAOAuthState(c.Context(), state)
+			redirectTo := cfg.FrontendBaseURL + "/channels?wa_oauth=error&reason=" +
+				url.QueryEscape(firstNonEmpty(errMsg, "no code returned"))
+			return c.Redirect(redirectTo, fiber.StatusFound)
+		}
+
+		userToken, err := channels.WhatsAppExchangeCode(c.Context(), cfg, code)
+		if err != nil {
+			log.Printf("wa oauth: exchange: %v", err)
+			_ = store.DeleteWAOAuthState(c.Context(), state)
+			return c.Redirect(cfg.FrontendBaseURL+"/channels?wa_oauth=error&reason=exchange_failed", fiber.StatusFound)
+		}
+
+		phoneNumbers, err := channels.WhatsAppListPhoneNumbers(c.Context(), userToken)
+		if err != nil {
+			log.Printf("wa oauth: list phone numbers: %v", err)
+			_ = store.DeleteWAOAuthState(c.Context(), state)
+			return c.Redirect(cfg.FrontendBaseURL+"/channels?wa_oauth=error&reason=list_phone_numbers_failed", fiber.StatusFound)
+		}
+
+		st.UserAccessToken = userToken
+		st.PhoneNumbers = phoneNumbers
+		if err := store.SaveWAOAuthState(c.Context(), st); err != nil {
+			log.Printf("wa oauth: save state: %v", err)
+		}
+
+		return c.Redirect(cfg.FrontendBaseURL+"/channels?wa_oauth=ok&state="+url.QueryEscape(state), fiber.StatusFound)
+	}
+}
+
+// ── Lazada OAuth callback ──────────────────────────────────────────────
+//
+// Lazada doesn't have a picker step — one OAuth handshake binds to one
+// seller, so we finish the connection right here. Country comes back as
+// a query param and we persist it on the connection so the regional API
+// host can be resolved on every subsequent call.
+
+func LazadaOAuthCallback(store *channels.Store, m *db.Mongo, cfg *config.Config) fiber.Handler {
+	return func(c *fiber.Ctx) error {
+		state := c.Query("state")
+		code := c.Query("code")
+		country := strings.ToLower(strings.TrimSpace(c.Query("country")))
+		errMsg := c.Query("error_description")
+
+		if state == "" {
+			return fiber.NewError(fiber.StatusBadRequest, "missing state")
+		}
+
+		st, err := store.GetLZOAuthState(c.Context(), state)
+		if err != nil {
+			return err
+		}
+		if st == nil {
+			return fiber.NewError(fiber.StatusBadRequest, "invalid or expired state")
+		}
+
+		if code == "" {
+			_ = store.DeleteLZOAuthState(c.Context(), state)
+			redirectTo := cfg.FrontendBaseURL + "/channels?lz_oauth=error&reason=" +
+				url.QueryEscape(firstNonEmpty(errMsg, "no code returned"))
+			return c.Redirect(redirectTo, fiber.StatusFound)
+		}
+
+		tok, err := channels.LazadaExchangeCode(c.Context(), cfg, code)
+		if err != nil {
+			log.Printf("lz oauth: exchange: %v", err)
+			_ = store.DeleteLZOAuthState(c.Context(), state)
+			return c.Redirect(cfg.FrontendBaseURL+"/channels?lz_oauth=error&reason=exchange_failed", fiber.StatusFound)
+		}
+
+		// Pick the first country binding when the callback didn't tell
+		// us which one to use. Most apps stick to a single country.
+		sellerID := tok.Account
+		shortCode := ""
+		if country == "" && len(tok.CountryUserInfo) > 0 {
+			country = strings.ToLower(tok.CountryUserInfo[0].Country)
+		}
+		for _, cu := range tok.CountryUserInfo {
+			if strings.EqualFold(cu.Country, country) {
+				if cu.SellerID != "" {
+					sellerID = cu.SellerID
+				}
+				shortCode = cu.ShortCode
+				break
+			}
+		}
+		if sellerID == "" {
+			sellerID = tok.Account
+		}
+
+		store2 := store // alias for readability
+		now := time.Now()
+		accessExp := now.Add(time.Duration(tok.ExpiresIn) * time.Second).UTC().Format(time.RFC3339)
+		refreshExp := now.Add(time.Duration(tok.RefreshExpiresIn) * time.Second).UTC().Format(time.RFC3339)
+
+		displayName := tok.Account
+		if shortCode != "" {
+			displayName = shortCode
+		}
+		if displayName == "" {
+			displayName = "Lazada Seller " + sellerID
+		}
+
+		conn := &models.ChannelConnection{
+			TenantID:    st.TenantID,
+			Provider:    models.ProviderLazada,
+			ExternalID:  sellerID,
+			DisplayName: displayName,
+			Credentials: map[string]string{
+				"access_token":             tok.AccessToken,
+				"refresh_token":            tok.RefreshToken,
+				"access_token_expires_at":  accessExp,
+				"refresh_token_expires_at": refreshExp,
+				"country":                  country,
+				"app_key":                  cfg.LZAppKey,
+				"app_secret":               cfg.LZAppSecret,
+			},
+			Config: map[string]any{
+				"country":    country,
+				"short_code": shortCode,
+			},
+			Status:    models.ChannelStatusActive,
+			CreatedBy: st.UserID,
+		}
+		if err := store2.Upsert(c.Context(), conn); err != nil {
+			log.Printf("lz oauth: upsert: %v", err)
+			_ = store.DeleteLZOAuthState(c.Context(), state)
+			return c.Redirect(cfg.FrontendBaseURL+"/channels?lz_oauth=error&reason=upsert_failed", fiber.StatusFound)
+		}
+
+		_ = store.DeleteLZOAuthState(c.Context(), state)
+		return c.Redirect(cfg.FrontendBaseURL+"/channels?lz_oauth=ok&seller_id="+url.QueryEscape(sellerID), fiber.StatusFound)
+	}
+}
+
 // cacheCustomerProfile fetches a customer's display name from the platform
 // (LINE only for now — Meta tightly restricts profile access on Messenger
 // and most page-scoped IDs return nothing useful) and caches it. Idempotent;

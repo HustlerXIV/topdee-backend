@@ -357,6 +357,65 @@ func (o *Orchestrator) HandleIncoming(
 	return resp.Reply, resp.Sources, conversationID, nil
 }
 
+// RecordAgentMessage persists a message the business sent to the customer
+// outside of topdee — e.g. an admin replying by hand in the Facebook Page
+// inbox, which reaches us as a `message_echoes` webhook. It stores the turn
+// as role="human" so the dashboard transcript stays complete, and does NOT
+// run an AI turn or push anything back to the platform (the message already
+// went out through the platform's own UI).
+//
+// conversationID must be the canonical "<provider>:<channel_id>:<user_id>"
+// address so the inbox groups it with the rest of the chat.
+func (o *Orchestrator) RecordAgentMessage(
+	ctx context.Context,
+	tenantID, conversationID, channel, externalUserID, message string,
+	attachments []models.Attachment,
+) error {
+	if conversationID == "" {
+		return errors.New("conversation id required")
+	}
+	content := strings.TrimSpace(message)
+	if content == "" && len(attachments) > 0 {
+		content = "[Image]"
+	}
+	if content == "" {
+		return nil // nothing to record
+	}
+
+	// Idempotency guard: Meta occasionally redelivers webhooks. Skip if we
+	// already stored an identical human turn for this conversation within a
+	// short window (covers retries without suppressing genuine repeats).
+	recent := time.Now().UTC().Add(-2 * time.Minute)
+	if n, err := o.mongo.DB.Collection("messages").CountDocuments(ctx, bson.M{
+		"conversation_id": conversationID,
+		"role":            models.RoleHuman,
+		"content":         content,
+		"created_at":      bson.M{"$gte": recent},
+	}); err == nil && n > 0 {
+		return nil
+	}
+
+	msg := models.Message{
+		ID:             uuid.NewString(),
+		TenantID:       tenantID,
+		ConversationID: conversationID,
+		Role:           models.RoleHuman,
+		Content:        content,
+		Channel:        channel,
+		ExternalUserID: externalUserID,
+		SenderName:     "Facebook",
+		Attachments:    attachments,
+		Metadata: map[string]any{
+			"source": "facebook_echo",
+		},
+		CreatedAt: time.Now().UTC(),
+	}
+	if _, err := o.mongo.DB.Collection("messages").InsertOne(ctx, msg); err != nil {
+		return err
+	}
+	return nil
+}
+
 // ── Handoff helpers ───────────────────────────────────────────────────────────
 
 // aiCantAnswerPhrases — substrings we look for in the AI's reply that signal

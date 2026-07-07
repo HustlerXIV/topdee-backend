@@ -56,6 +56,14 @@ type ParsedEvent struct {
 	// human turn; the orchestrator must NOT run an AI turn or push a reply
 	// for them. ExternalUserID still points at the customer side of the chat.
 	IsAgentEcho bool
+	// EchoAppID is the `app_id` carried on a Facebook message_echoes event, if
+	// any. It identifies which app sent the message: our own topdee app (bot
+	// replies + dashboard human replies dispatched via the Send API) vs. a
+	// reply typed natively in the Page inbox / Business Suite (which is either
+	// absent or Meta's own Pages app id). The webhook router compares this to
+	// our configured FB app id to decide whether the echo is our own (skip,
+	// already stored) or an external human reply (record). Zero when absent.
+	EchoAppID int64
 	// Raw is the original event JSON, kept for logging / debugging.
 	Raw map[string]any
 }

@@ -154,6 +154,21 @@ func processEvents(
 
 		for _, evt := range batch {
 			conversationID := fmt.Sprintf("%s:%s:%s", p.Name(), externalID, evt.ExternalUserID)
+
+			// Agent echo: the business replied to the customer outside topdee
+			// (e.g. an admin typing in the Facebook Page inbox). Record it to
+			// the transcript as a human turn and stop — no AI turn, no push.
+			if evt.IsAgentEcho {
+				if err := o.RecordAgentMessage(
+					ctx, conn.TenantID, conversationID,
+					channelTag, evt.ExternalUserID, evt.Text, evt.Attachments,
+				); err != nil {
+					log.Printf("webhook %s: record agent echo: %v", p.Name(), err)
+				}
+				go broadcastInboxUpdate(hub, m, conn.TenantID)
+				continue
+			}
+
 			reply, _, _, err := o.HandleIncoming(
 				ctx, conn.TenantID, conversationID,
 				channelTag, evt.ExternalUserID, evt.Text, evt.Attachments,

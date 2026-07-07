@@ -50,6 +50,12 @@ type ParsedEvent struct {
 	Timestamp time.Time
 	// ReplyToken — LINE's free reply mechanism. Empty for FB.
 	ReplyToken string
+	// IsAgentEcho marks a message the business itself sent that we learned
+	// about via a platform echo webhook — e.g. an admin replying by hand in
+	// the Facebook Page inbox. These are recorded to the transcript as a
+	// human turn; the orchestrator must NOT run an AI turn or push a reply
+	// for them. ExternalUserID still points at the customer side of the chat.
+	IsAgentEcho bool
 	// Raw is the original event JSON, kept for logging / debugging.
 	Raw map[string]any
 }

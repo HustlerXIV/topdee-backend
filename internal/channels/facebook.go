@@ -70,8 +70,15 @@ func (FacebookProvider) ParseEvents(body []byte) ([]ParsedEvent, error) {
 				} `json:"recipient"`
 				Timestamp int64 `json:"timestamp"`
 				Message   *struct {
-					Text        string `json:"text"`
-					IsEcho      bool   `json:"is_echo"`
+					Text   string `json:"text"`
+					IsEcho bool   `json:"is_echo"`
+					// AppID is present on echo events only when the message was
+					// sent through the Graph API by an app (i.e. our own bot or
+					// the dashboard's human-reply endpoint). Human replies typed
+					// directly in the FB Page inbox / Messenger app carry NO
+					// app_id — that's how we tell the two apart without needing
+					// our app id in this pure parser.
+					AppID       int64 `json:"app_id"`
 					Attachments []struct {
 						Type    string `json:"type"`
 						Payload struct {
@@ -88,11 +95,10 @@ func (FacebookProvider) ParseEvents(body []byte) ([]ParsedEvent, error) {
 	out := []ParsedEvent{}
 	for _, e := range p.Entry {
 		for _, m := range e.Messaging {
-			if m.Message == nil || m.Message.IsEcho {
-				// `is_echo` events are our own outbound replies bouncing
-				// back from Meta — drop them or we'll loop.
+			if m.Message == nil {
 				continue
 			}
+
 			text := strings.TrimSpace(m.Message.Text)
 			attachments := make([]models.Attachment, 0, len(m.Message.Attachments))
 			for _, a := range m.Message.Attachments {
@@ -110,6 +116,34 @@ func (FacebookProvider) ParseEvents(body []byte) ([]ParsedEvent, error) {
 			if m.Timestamp == 0 {
 				ts = time.UnixMilli(e.Time)
 			}
+
+			if m.Message.IsEcho {
+				// Echo = a message the *page* sent. Two sources:
+				//
+				//   • app_id present → sent via the Graph API by an app: our
+				//     own bot reply, or a human reply dispatched from the
+				//     topdee dashboard. Both are already persisted on our
+				//     side, so drop them (also avoids reply loops).
+				//
+				//   • app_id absent → a human admin typed this directly in the
+				//     Facebook Page inbox / Messenger app / Business Suite.
+				//     We want it in the transcript, recorded as a human turn.
+				if m.Message.AppID != 0 {
+					continue
+				}
+				// In an echo, sender is the page and recipient is the customer,
+				// so the conversation is keyed by the recipient's PSID.
+				out = append(out, ParsedEvent{
+					ExternalChannelID: e.ID,
+					ExternalUserID:    m.Recipient.ID,
+					Text:              text,
+					Attachments:       attachments,
+					Timestamp:         ts,
+					IsAgentEcho:       true,
+				})
+				continue
+			}
+
 			out = append(out, ParsedEvent{
 				ExternalChannelID: e.ID,
 				ExternalUserID:    m.Sender.ID,
@@ -388,7 +422,11 @@ func FacebookSubscribePage(ctx context.Context, pageAccessToken, pageID string) 
 	}
 	u := "https://graph.facebook.com/" + graphVersion + "/" + url.PathEscape(pageID) + "/subscribed_apps"
 	body := url.Values{
-		"subscribed_fields": {"messages,messaging_postbacks"},
+		// message_echoes delivers messages the page *sends* — including
+		// replies an admin types manually in the FB Page inbox / Messenger
+		// app / Business Suite. Without it those never reach us and the
+		// dashboard transcript is missing the human side of the chat.
+		"subscribed_fields": {"messages,messaging_postbacks,message_echoes"},
 		"access_token":      {pageAccessToken},
 	}
 	req, err := http.NewRequestWithContext(ctx, "POST", u, bytes.NewBufferString(body.Encode()))

@@ -382,13 +382,17 @@ func (o *Orchestrator) RecordAgentMessage(
 		return nil // nothing to record
 	}
 
-	// Idempotency guard: Meta occasionally redelivers webhooks. Skip if we
-	// already stored an identical human turn for this conversation within a
-	// short window (covers retries without suppressing genuine repeats).
+	// Idempotency / self-echo guard. Skip if we already stored an outbound
+	// turn with identical content for this conversation in the last couple of
+	// minutes. This covers two cases:
+	//   • Meta redelivering the same echo webhook.
+	//   • An echo of a message topdee itself sent (bot reply=ai/suggestion,
+	//     or a dashboard human reply=human) slipping past the app_id check —
+	//     those are already persisted, so we must not duplicate them.
 	recent := time.Now().UTC().Add(-2 * time.Minute)
 	if n, err := o.mongo.DB.Collection("messages").CountDocuments(ctx, bson.M{
 		"conversation_id": conversationID,
-		"role":            models.RoleHuman,
+		"role":            bson.M{"$in": []string{models.RoleHuman, models.RoleAI, models.RoleSuggestion}},
 		"content":         content,
 		"created_at":      bson.M{"$gte": recent},
 	}); err == nil && n > 0 {

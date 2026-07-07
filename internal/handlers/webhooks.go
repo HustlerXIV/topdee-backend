@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"log"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -155,10 +156,19 @@ func processEvents(
 		for _, evt := range batch {
 			conversationID := fmt.Sprintf("%s:%s:%s", p.Name(), externalID, evt.ExternalUserID)
 
-			// Agent echo: the business replied to the customer outside topdee
-			// (e.g. an admin typing in the Facebook Page inbox). Record it to
-			// the transcript as a human turn and stop — no AI turn, no push.
+			// Agent echo: a message the page sent, delivered back to us via
+			// message_echoes. If it came from OUR own app (bot reply or a
+			// dashboard human reply, both dispatched via the Send API) it's
+			// already stored — skip to avoid loops/dupes. Otherwise an admin
+			// typed it natively in the Facebook Page inbox / Business Suite:
+			// record it as a human turn, no AI turn, no push.
 			if evt.IsAgentEcho {
+				log.Printf("webhook %s: echo received conv=%s app_id=%d (our app_id=%s)",
+					p.Name(), conversationID, evt.EchoAppID, cfg.FBAppID)
+				if cfg.FBAppID != "" && evt.EchoAppID != 0 &&
+					strconv.FormatInt(evt.EchoAppID, 10) == cfg.FBAppID {
+					continue
+				}
 				if err := o.RecordAgentMessage(
 					ctx, conn.TenantID, conversationID,
 					channelTag, evt.ExternalUserID, evt.Text, evt.Attachments,

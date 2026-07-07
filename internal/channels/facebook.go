@@ -118,19 +118,21 @@ func (FacebookProvider) ParseEvents(body []byte) ([]ParsedEvent, error) {
 			}
 
 			if m.Message.IsEcho {
-				// Echo = a message the *page* sent. Two sources:
+				// Echo = a message the *page* sent. Could be:
 				//
-				//   • app_id present → sent via the Graph API by an app: our
-				//     own bot reply, or a human reply dispatched from the
-				//     topdee dashboard. Both are already persisted on our
-				//     side, so drop them (also avoids reply loops).
+				//   • our own topdee app (bot AI reply, or a human reply the
+				//     dashboard dispatched via the Send API) — app_id == our
+				//     FB app id. Already stored on our side, so the router
+				//     drops these to avoid loops/dupes.
 				//
-				//   • app_id absent → a human admin typed this directly in the
-				//     Facebook Page inbox / Messenger app / Business Suite.
-				//     We want it in the transcript, recorded as a human turn.
-				if m.Message.AppID != 0 {
-					continue
-				}
+				//   • a reply an admin typed directly in the Facebook Page
+				//     inbox / Messenger app / Business Suite — app_id is either
+				//     absent or Meta's own Pages app id, never ours. We want
+				//     these in the transcript as a human turn.
+				//
+				// We can't decide here (this parser has no config), so we carry
+				// app_id up and let the webhook router compare it to cfg.FBAppID.
+				//
 				// In an echo, sender is the page and recipient is the customer,
 				// so the conversation is keyed by the recipient's PSID.
 				out = append(out, ParsedEvent{
@@ -140,6 +142,7 @@ func (FacebookProvider) ParseEvents(body []byte) ([]ParsedEvent, error) {
 					Attachments:       attachments,
 					Timestamp:         ts,
 					IsAgentEcho:       true,
+					EchoAppID:         m.Message.AppID,
 				})
 				continue
 			}

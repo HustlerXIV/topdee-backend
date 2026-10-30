@@ -211,19 +211,25 @@ func (h *AdminReferralHandler) MarkPayoutDone(c *fiber.Ctx) error {
 		return fiber.NewError(fiber.StatusBadRequest, "missing wallet id")
 	}
 
-	var wallet models.Wallet
-	if err := h.mongo.DB.Collection("wallets").
-		FindOne(c.Context(), bson.M{"_id": walletID}).Decode(&wallet); err == mongo.ErrNoDocuments {
-		return fiber.NewError(fiber.StatusNotFound, "wallet not found")
+	now := time.Now().UTC()
+
+	// Atomically claim the balance: filter `balance > 0` so this can't race
+	// with a concurrent tenant-initiated payout request (or another admin)
+	// and pay out the same balance twice. FindOneAndUpdate returns the
+	// pre-update document, giving us the exact amount claimed.
+	var claimed models.Wallet
+	err := h.mongo.DB.Collection("wallets").FindOneAndUpdate(
+		c.Context(),
+		bson.M{"_id": walletID, "balance": bson.M{"$gt": 0}},
+		bson.M{"$set": bson.M{"balance": 0, "updated_at": now}},
+	).Decode(&claimed)
+	if err == mongo.ErrNoDocuments {
+		// Either no wallet, or balance already zero — both mean nothing to pay.
+		return fiber.NewError(fiber.StatusBadRequest, "wallet balance is already zero")
 	} else if err != nil {
 		return err
 	}
-	if wallet.Balance <= 0 {
-		return fiber.NewError(fiber.StatusBadRequest, "wallet balance is already zero")
-	}
-
-	amount := wallet.Balance
-	now := time.Now().UTC()
+	amount := claimed.Balance
 
 	txn := models.WalletTransaction{
 		ID:          uuid.NewString(),
@@ -234,13 +240,9 @@ func (h *AdminReferralHandler) MarkPayoutDone(c *fiber.Ctx) error {
 		CreatedAt:   now,
 	}
 	if _, err := h.mongo.DB.Collection("wallet_transactions").InsertOne(c.Context(), txn); err != nil {
-		return err
-	}
-	if _, err := h.mongo.DB.Collection("wallets").UpdateOne(
-		c.Context(),
-		bson.M{"_id": walletID},
-		bson.M{"$set": bson.M{"balance": 0, "updated_at": now}},
-	); err != nil {
+		// Refund the claim so the balance isn't lost without an audit trail.
+		_, _ = h.mongo.DB.Collection("wallets").UpdateOne(c.Context(),
+			bson.M{"_id": walletID}, bson.M{"$inc": bson.M{"balance": amount}})
 		return err
 	}
 

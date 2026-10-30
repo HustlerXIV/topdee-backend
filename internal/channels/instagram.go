@@ -134,7 +134,7 @@ func (InstagramProvider) ParseEvents(body []byte) ([]ParsedEvent, error) {
 // with FB_APP_SECRET, checked against X-Hub-Signature-256.
 func (InstagramProvider) VerifySignature(headers map[string]string, body []byte, cfg *config.Config, _ *models.ChannelConnection) bool {
 	if cfg.FBAppSecret == "" {
-		return true
+		return acceptUnverifiedWebhook(cfg, "instagram")
 	}
 	sig := headerCI(headers, "X-Hub-Signature-256")
 	const prefix = "sha256="

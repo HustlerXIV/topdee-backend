@@ -160,11 +160,12 @@ func (FacebookProvider) ParseEvents(body []byte) ([]ParsedEvent, error) {
 }
 
 // VerifySignature checks `X-Hub-Signature-256` — `sha256=<hex(hmac_sha256(secret, body))>`.
-// When FB_APP_SECRET is unset (typical local-dev), we accept everything;
-// production setups should always set it.
+// When FB_APP_SECRET is unset (typical local-dev), behaviour depends on
+// WEBHOOK_REQUIRE_SIGNATURE (see acceptUnverifiedWebhook); production setups
+// should always set the secret.
 func (FacebookProvider) VerifySignature(headers map[string]string, body []byte, cfg *config.Config, _ *models.ChannelConnection) bool {
 	if cfg.FBAppSecret == "" {
-		return true
+		return acceptUnverifiedWebhook(cfg, "facebook")
 	}
 	sig := headerCI(headers, "X-Hub-Signature-256")
 	const prefix = "sha256="

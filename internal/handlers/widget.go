@@ -156,6 +156,37 @@ func (h *WidgetHandler) Chat(c *fiber.Ctx) error {
 		return fiber.NewError(fiber.StatusBadRequest, "message too long (max 4000 chars)")
 	}
 
+	// ── Guard against conversation_id hijacking (IDOR) ──────────────────────
+	// The widget generates its own conversation_id (a client UUID). A malicious
+	// caller could instead supply a platform thread id like
+	// "facebook:<page_id>:<psid>" — which is deterministic and guessable — to
+	// make the AI load another customer's private history into its prompt (and
+	// to inject turns into that real thread). Only genuine web conversations
+	// are allowed here.
+	if req.ConversationID != "" {
+		// 1. Reject anything shaped like a channel thread (provider:chan:user).
+		//    Legitimate widget ids are UUIDs and never match this pattern.
+		if _, _, _, isChannelID := parseConversationID(req.ConversationID); isChannelID {
+			return fiber.NewError(fiber.StatusBadRequest, "invalid conversation_id")
+		}
+		// 2. Defense in depth: if any message already exists under this id on a
+		//    non-web channel, it isn't this visitor's web thread — refuse.
+		nonWeb, err := h.mongo.DB.Collection("messages").CountDocuments(
+			c.Context(),
+			bson.M{
+				"tenant_id":       tenant.ID,
+				"conversation_id": req.ConversationID,
+				"channel":         bson.M{"$ne": models.ChannelWeb},
+			},
+		)
+		if err != nil {
+			return err
+		}
+		if nonWeb > 0 {
+			return fiber.NewError(fiber.StatusForbidden, "invalid conversation_id")
+		}
+	}
+
 	visitorID := req.VisitorID
 	if visitorID == "" {
 		visitorID = "web-visitor"

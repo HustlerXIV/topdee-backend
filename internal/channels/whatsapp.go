@@ -177,7 +177,7 @@ func (WhatsAppProvider) ParseEvents(body []byte) ([]ParsedEvent, error) {
 // raw body with FB_APP_SECRET, checked against X-Hub-Signature-256.
 func (WhatsAppProvider) VerifySignature(headers map[string]string, body []byte, cfg *config.Config, _ *models.ChannelConnection) bool {
 	if cfg.FBAppSecret == "" {
-		return true
+		return acceptUnverifiedWebhook(cfg, "whatsapp")
 	}
 	sig := headerCI(headers, "X-Hub-Signature-256")
 	const prefix = "sha256="

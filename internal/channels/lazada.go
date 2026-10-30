@@ -201,7 +201,7 @@ func (LazadaProvider) ParseEvents(body []byte) ([]ParsedEvent, error) {
 // HMAC-SHA256 over the raw body using the app secret, uppercase hex.
 func (LazadaProvider) VerifySignature(headers map[string]string, body []byte, cfg *config.Config, _ *models.ChannelConnection) bool {
 	if cfg.LZAppSecret == "" {
-		return true
+		return acceptUnverifiedWebhook(cfg, "lazada")
 	}
 	sig := headerCI(headers, "X-Lazop-Signature")
 	if sig == "" {

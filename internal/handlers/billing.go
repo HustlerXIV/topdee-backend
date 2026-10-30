@@ -16,6 +16,7 @@ package handlers
 import (
 	"context"
 	"fmt"
+	"math"
 	"sort"
 	"sync"
 	"time"
@@ -234,10 +235,12 @@ func (h *BillingHandler) CreatePromptPayCheckout(c *fiber.Ctx) error {
 		if yp == 0 {
 			yp = plan.Price * 12
 		}
-		amountSatang = int64(yp * 100)
+		// Round rather than truncate: 349.90 * 100 == 34989.99999… in float,
+		// which int64() would truncate to 34989 satang (฿0.01 short).
+		amountSatang = int64(math.Round(yp * 100))
 		periodLabel = "1 ปี / 1 Year"
 	} else {
-		amountSatang = int64(plan.Price * 100)
+		amountSatang = int64(math.Round(plan.Price * 100))
 		periodLabel = "1 เดือน / 1 Month"
 	}
 
@@ -552,6 +555,10 @@ func (h *BillingHandler) ReactivateSubscription(c *fiber.Ctx) error {
 //
 //  1. cancel_at_period_end=true and current_period_end has passed.
 //  2. status=trialing and trial_ends_at has passed.
+//  3. status=past_due and current_period_end has passed — i.e. Stripe dunning
+//     has run past the paid-through date without recovering. We deliberately do
+//     NOT downgrade on the first payment_failed (dunning may still succeed);
+//     only once the grace period (the paid-for window) has lapsed.
 func ExpireSubscriptions(ctx context.Context, mongo *db.Mongo) (int, error) {
 	now := time.Now().UTC()
 
@@ -565,6 +572,10 @@ func ExpireSubscriptions(ctx context.Context, mongo *db.Mongo) (int, error) {
 			{
 				"subscription.status":        "trialing",
 				"subscription.trial_ends_at": bson.M{"$lte": now},
+			},
+			{
+				"subscription.status":             "past_due",
+				"subscription.current_period_end": bson.M{"$lte": now},
 			},
 		},
 	}
@@ -652,30 +663,12 @@ func (h *BillingHandler) SyncCheckoutSession(c *fiber.Ctx) error {
 			adminNotes = existing.Subscription.AdminNotes
 		}
 
-		sub := &models.Subscription{
-			Status:            models.SubStatusActive,
-			CurrentPeriodEnd:  &periodEnd,
-			CancelAtPeriodEnd: true, // auto-expires unless tenant renews
-			AdminNotes:        adminNotes,
-			UpdatedAt:         now,
-		}
-		updates := bson.M{
-			"subscription":           sub,
-			"stripe_subscription_id": "", // PromptPay is not a recurring Stripe subscription
-		}
-		if planSlug != "" {
-			updates["plan"] = planSlug
-		}
-		syncUpdate := bson.M{"$set": updates}
-		if existing.ReferralDiscountType == models.DiscountTypeFirstPurchase || existing.ReferralDiscountType == "" {
-			syncUpdate["$unset"] = bson.M{"referral_discount_expires_at": ""}
-		}
-		_, _ = h.mongo.DB.Collection("tenants").UpdateOne(ctx,
-			bson.M{"_id": tid},
-			syncUpdate,
-		)
-
-		// ── Upsert Payment record (idempotent: session ID is _id) ────────────────
+		// ── Upsert the Payment record FIRST — this is the idempotency anchor.
+		// The session ID is the document _id, so the plan grant below can be
+		// gated on this being the first time we process this session. Without
+		// this gate, a client could replay the same paid session_id every
+		// month to extend the plan forever (the period end is computed from
+		// `now`, and the auto-expire sweep would never fire). ────────────────
 		var planDoc models.Plan
 		_ = h.mongo.DB.Collection("plans").FindOne(ctx, bson.M{"_id": planSlug}).Decode(&planDoc)
 		planName := planSlug
@@ -708,17 +701,50 @@ func (h *BillingHandler) SyncCheckoutSession(c *fiber.Ctx) error {
 			ReceiptURL:  receiptURL,
 			CreatedAt:   now,
 		}
-		payResult, _ := h.mongo.DB.Collection("payments").ReplaceOne(ctx,
+		// $setOnInsert so replays never overwrite the original payment record;
+		// UpsertedCount==1 iff this is the first time we've seen this session.
+		payResult, err := h.mongo.DB.Collection("payments").UpdateOne(ctx,
 			bson.M{"_id": payment.ID},
-			payment,
-			options.Replace().SetUpsert(true),
+			bson.M{"$setOnInsert": payment},
+			options.Update().SetUpsert(true),
 		)
-		// Credit referral commission only on the first insert (UpsertedCount==1).
-		// Both SyncCheckoutSession and the Stripe webhook may process the same
-		// session — this guard prevents double-crediting.
-		if payResult != nil && payResult.UpsertedCount > 0 {
-			go creditReferralCommission(h.mongo, &existing)
+		if err != nil {
+			return fiber.NewError(fiber.StatusInternalServerError, "record payment: "+err.Error())
 		}
+		// Replay (or the webhook already processed this session): the plan was
+		// already granted for this payment, so do NOT extend it again.
+		if payResult.UpsertedCount == 0 {
+			return c.SendStatus(fiber.StatusNoContent)
+		}
+
+		// ── First time seeing this session: grant the plan + access period. ──
+		sub := &models.Subscription{
+			Status:            models.SubStatusActive,
+			CurrentPeriodEnd:  &periodEnd,
+			CancelAtPeriodEnd: true, // auto-expires unless tenant renews
+			AdminNotes:        adminNotes,
+			UpdatedAt:         now,
+		}
+		updates := bson.M{
+			"subscription":           sub,
+			"stripe_subscription_id": "", // PromptPay is not a recurring Stripe subscription
+		}
+		if planSlug != "" {
+			updates["plan"] = planSlug
+		}
+		syncUpdate := bson.M{"$set": updates}
+		if existing.ReferralDiscountType == models.DiscountTypeFirstPurchase || existing.ReferralDiscountType == "" {
+			syncUpdate["$unset"] = bson.M{"referral_discount_expires_at": ""}
+		}
+		if _, err := h.mongo.DB.Collection("tenants").UpdateOne(ctx,
+			bson.M{"_id": tid},
+			syncUpdate,
+		); err != nil {
+			return fiber.NewError(fiber.StatusInternalServerError, "apply plan: "+err.Error())
+		}
+
+		// Credit referral commission (first insert only, guaranteed above).
+		go creditReferralCommission(h.mongo, &existing)
 
 		return c.SendStatus(fiber.StatusNoContent)
 	}
@@ -979,13 +1005,15 @@ func (h *BillingHandler) GetInfo(c *fiber.Ctx) error {
 	startOfMonth := time.Date(
 		time.Now().UTC().Year(), time.Now().UTC().Month(), 1, 0, 0, 0, 0, time.UTC,
 	)
-	// Count only AI-generated replies, not inbound customer messages or
-	// human-team messages. Roles: "ai" (sent) | "suggestion" (drafted, not sent).
-	// We count only "ai" — suggestions that were never sent shouldn't count.
+	// Count exactly what the monthly quota enforces (see checkMonthlyQuota in
+	// chat.go): inbound user-role messages on real (non-dashboard) channels this
+	// calendar month. This keeps the number shown to the tenant identical to the
+	// number that is actually metered against their plan.
 	msgCount, _ := h.mongo.DB.Collection("messages").
 		CountDocuments(ctx, bson.M{
 			"tenant_id":  tid,
-			"role":       "ai",
+			"role":       models.RoleUser,
+			"channel":    bson.M{"$ne": models.ChannelDashboard},
 			"created_at": bson.M{"$gte": startOfMonth},
 		})
 

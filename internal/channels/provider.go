@@ -20,12 +20,33 @@ package channels
 import (
 	"context"
 	"errors"
+	"log"
 	"sync"
 	"time"
 
 	"github.com/topdee/backend/internal/config"
 	"github.com/topdee/backend/internal/models"
 )
+
+// acceptUnverifiedWebhook decides what to do when a provider has NO signing
+// secret configured. Historically every such request was accepted (fail-open)
+// so local dev and installs without app secrets kept working — but that means
+// anyone who can reach the webhook URL can forge inbound events for any tenant.
+//
+// To avoid breaking existing deployments (e.g. Facebook running without
+// FB_APP_SECRET), the default remains accept-but-warn. Operators flip
+// WEBHOOK_REQUIRE_SIGNATURE=true to fail-closed once every connected
+// provider's secret is set. Either way the decision is logged loudly so the
+// gap is never silent. When a secret IS configured, the provider verifies the
+// signature strictly and never reaches this helper.
+func acceptUnverifiedWebhook(cfg *config.Config, provider string) bool {
+	if cfg != nil && cfg.RequireWebhookSignature {
+		log.Printf("[webhook] REJECT %s: no signing secret configured and WEBHOOK_REQUIRE_SIGNATURE=true", provider)
+		return false
+	}
+	log.Printf("[webhook] WARNING %s: accepting UNVERIFIED webhook — no signing secret configured; set the secret and WEBHOOK_REQUIRE_SIGNATURE=true to secure", provider)
+	return true
+}
 
 // ParsedEvent is the platform-neutral form of one inbound message.
 //

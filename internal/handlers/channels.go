@@ -252,7 +252,8 @@ func (h *ChannelsHandler) ConnectLine(c *fiber.Ctx) error {
 	}
 
 	// Plan check.
-	if err := h.enforceLimit(c, tid, models.ProviderLine, req.ChannelID); err != nil {
+	newIDs, err := h.enforceLimit(c, tid, models.ProviderLine, req.ChannelID)
+	if err != nil {
 		return err
 	}
 
@@ -291,6 +292,11 @@ func (h *ChannelsHandler) ConnectLine(c *fiber.Ctx) error {
 		if errors.Is(err, channels.ErrConnectionTaken) {
 			return fiber.NewError(fiber.StatusConflict, err.Error())
 		}
+		return err
+	}
+	// Race-safe verify: re-check the cap after insert and roll back if a
+	// concurrent connect pushed us over.
+	if err := h.finalizeLimit(c, tid, models.ProviderLine, newIDs); err != nil {
 		return err
 	}
 	return c.JSON(h.toView(conn))
@@ -420,7 +426,8 @@ func (h *ChannelsHandler) FacebookOAuthConnect(c *fiber.Ctx) error {
 	// Pre-flight: make sure connecting all the requested pages won't bust
 	// the plan limit. The helper handles per-provider vs. total-cap modes
 	// and treats reconnects as free.
-	if err := h.enforceLimitWithAdd(c, tid, models.ProviderFacebook, req.PageIDs); err != nil {
+	newIDs, err := h.enforceLimitWithAdd(c, tid, models.ProviderFacebook, req.PageIDs)
+	if err != nil {
 		return err
 	}
 
@@ -460,6 +467,12 @@ func (h *ChannelsHandler) FacebookOAuthConnect(c *fiber.Ctx) error {
 		connected = append(connected, h.toView(conn))
 	}
 
+	// Race-safe verify: re-check the cap after inserting and roll back this
+	// request's new connections if a concurrent connect busted the limit.
+	if err := h.finalizeLimit(c, tid, models.ProviderFacebook, newIDs); err != nil {
+		return err
+	}
+
 	// Done with the state — kill it so the same handshake can't be replayed.
 	_ = h.store.DeleteOAuthState(c.Context(), req.State)
 
@@ -471,7 +484,12 @@ func (h *ChannelsHandler) FacebookOAuthConnect(c *fiber.Ctx) error {
 // enforceLimit checks the tenant's plan against the channel cap. Reconnecting
 // an *existing* connection (same external_id) is always allowed — we just
 // upsert without counting it twice. Single-page connect → addCount = 1.
-func (h *ChannelsHandler) enforceLimit(c *fiber.Ctx, tid, provider, externalID string) error {
+//
+// Returns the subset of external ids that are genuinely new (not reconnects);
+// callers pass these to finalizeLimit after inserting so the post-insert
+// re-check can roll back the right connections if a concurrent connect pushed
+// the tenant over the cap.
+func (h *ChannelsHandler) enforceLimit(c *fiber.Ctx, tid, provider, externalID string) ([]string, error) {
 	return h.enforceLimitWithAdd(c, tid, provider, []string{externalID})
 }
 
@@ -488,67 +506,147 @@ func (h *ChannelsHandler) enforceLimit(c *fiber.Ctx, tid, provider, externalID s
 //
 // In both modes, reconnecting an existing external_id owned by this tenant
 // doesn't consume a new slot — we filter those out of the count.
-func (h *ChannelsHandler) enforceLimitWithAdd(c *fiber.Ctx, tid, provider string, externalIDs []string) error {
+func (h *ChannelsHandler) enforceLimitWithAdd(c *fiber.Ctx, tid, provider string, externalIDs []string) ([]string, error) {
 	plan := tenantPlan(c.Context(), h.mongo, tid)
 	policy := channels.PolicyForCtx(c.Context(), h.mongo.DB, plan)
 
 	// Hide-by-zero: even in total mode, an admin can pin a provider to 0
 	// on a given plan to gate it out.
 	if policy.ProviderHidden(provider) {
-		return fiber.NewError(
+		return nil, fiber.NewError(
 			fiber.StatusForbidden,
 			"this plan does not include "+provider+" connections",
 		)
 	}
 
-	// Count only the genuinely-new external IDs — reconnects are free.
-	newAdds := 0
+	// Collect only the genuinely-new external IDs — reconnects are free. The
+	// returned slice lets the caller roll back exactly these (never a
+	// pre-existing reconnected connection) in finalizeLimit.
+	newIDs := make([]string, 0, len(externalIDs))
 	for _, ext := range externalIDs {
 		if ext == "" {
-			// Auto-generated (e.g. web widget UUID) — always a new slot.
-			newAdds++
+			// Auto-generated (e.g. web widget UUID) — always a new slot. The
+			// caller knows the real generated id and passes it to finalizeLimit
+			// directly, so we don't return the placeholder for rollback.
+			newIDs = append(newIDs, ext)
 			continue
 		}
 		existing, err := h.store.FindByExternal(c.Context(), provider, ext)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		if existing != nil && existing.TenantID == tid {
 			continue // reconnect — free
 		}
-		newAdds++
+		newIDs = append(newIDs, ext)
 	}
+	newAdds := len(newIDs)
 	if newAdds == 0 {
-		return nil // everything is a reconnect
+		return newIDs, nil // everything is a reconnect
 	}
 
 	if policy.IsTotalMode() {
 		used, err := h.store.CountByTenant(c.Context(), tid)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		if policy.Total >= 0 && int(used)+newAdds > policy.Total {
-			return fiber.NewError(
+			return nil, fiber.NewError(
 				fiber.StatusForbidden,
 				"this plan allows up to "+itoa(policy.Total)+" total channels (currently "+itoa(int(used))+")",
 			)
 		}
-		return nil
+		return newIDs, nil
 	}
 
 	// Per-provider mode — original behavior.
 	limit := channels.LimitForCtx(c.Context(), h.mongo.DB, plan, provider)
 	used, err := h.store.CountByProvider(c.Context(), tid, provider)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if limit >= 0 && int(used)+newAdds > limit {
-		return fiber.NewError(
+		return nil, fiber.NewError(
 			fiber.StatusForbidden,
 			"this plan allows up to "+itoa(limit)+" "+provider+" connections",
 		)
 	}
-	return nil
+	return newIDs, nil
+}
+
+// finalizeLimit re-checks the plan cap AFTER the connections have been inserted
+// and rolls back (deletes) the just-created connections if the post-insert
+// count busts the cap. This converts the earlier check-then-act into
+// insert-then-verify, which is race-safe: two concurrent connects that both
+// passed the pre-flight enforceLimit* check (each seeing used=limit-1) will both
+// observe the inflated count here and undo their own inserts rather than
+// silently exceeding the plan.
+//
+// newExternalIDs are the ids genuinely created by THIS request (reconnects
+// excluded upstream), so we never delete a connection the tenant already owned.
+//
+// Tradeoff: on overflow we roll back ALL of this request's new connections
+// (all-or-nothing for the request) rather than trimming to fit — simpler and
+// fail-closed. The caller sees the same forbidden error as the pre-check and
+// can retry with fewer channels. Concurrent connects may both roll back even
+// though one could have fit; that's acceptable (never over-provisions).
+func (h *ChannelsHandler) finalizeLimit(c *fiber.Ctx, tid, provider string, newExternalIDs []string) error {
+	// Drop empty placeholders — callers that auto-generate ids pass the real
+	// id explicitly.
+	ids := make([]string, 0, len(newExternalIDs))
+	for _, ext := range newExternalIDs {
+		if ext != "" {
+			ids = append(ids, ext)
+		}
+	}
+	if len(ids) == 0 {
+		return nil
+	}
+
+	plan := tenantPlan(c.Context(), h.mongo, tid)
+	policy := channels.PolicyForCtx(c.Context(), h.mongo.DB, plan)
+
+	over := false
+	limit := 0
+	totalMode := policy.IsTotalMode()
+	if totalMode {
+		used, err := h.store.CountByTenant(c.Context(), tid)
+		if err != nil {
+			return err
+		}
+		limit = policy.Total
+		over = policy.Total >= 0 && int(used) > policy.Total
+	} else {
+		limit = channels.LimitForCtx(c.Context(), h.mongo.DB, plan, provider)
+		used, err := h.store.CountByProvider(c.Context(), tid, provider)
+		if err != nil {
+			return err
+		}
+		over = limit >= 0 && int(used) > limit
+	}
+	if !over {
+		return nil
+	}
+
+	// Roll back the connections this request created.
+	for _, ext := range ids {
+		existing, err := h.store.FindByExternal(c.Context(), provider, ext)
+		if err != nil || existing == nil || existing.TenantID != tid {
+			continue
+		}
+		_, _ = h.store.Delete(c.Context(), tid, existing.ID)
+	}
+
+	if totalMode {
+		return fiber.NewError(
+			fiber.StatusForbidden,
+			"this plan allows up to "+itoa(limit)+" total channels",
+		)
+	}
+	return fiber.NewError(
+		fiber.StatusForbidden,
+		"this plan allows up to "+itoa(limit)+" "+provider+" connections",
+	)
 }
 
 func tenantPlan(ctx context.Context, m *db.Mongo, tid string) string {
@@ -669,7 +767,8 @@ func (h *ChannelsHandler) InstagramOAuthConnect(c *fiber.Ctx) error {
 	}
 
 	// Pre-flight plan limit check — branches on per-provider vs total mode.
-	if err := h.enforceLimitWithAdd(c, tid, models.ProviderInstagram, req.IGIDs); err != nil {
+	newIDs, err := h.enforceLimitWithAdd(c, tid, models.ProviderInstagram, req.IGIDs)
+	if err != nil {
 		return err
 	}
 
@@ -708,6 +807,12 @@ func (h *ChannelsHandler) InstagramOAuthConnect(c *fiber.Ctx) error {
 			_ = h.store.MarkError(c.Context(), conn.ID, "subscribe failed: "+err.Error())
 		}
 		connected = append(connected, h.toView(conn))
+	}
+
+	// Race-safe verify: re-check the cap after inserting and roll back if a
+	// concurrent connect busted the limit.
+	if err := h.finalizeLimit(c, tid, models.ProviderInstagram, newIDs); err != nil {
+		return err
 	}
 
 	_ = h.store.DeleteIGOAuthState(c.Context(), req.State)
@@ -832,7 +937,8 @@ func (h *ChannelsHandler) TikTokOAuthConnect(c *fiber.Ctx) error {
 	}
 
 	// Pre-flight plan limit check — branches on per-provider vs total mode.
-	if err := h.enforceLimitWithAdd(c, tid, models.ProviderTikTok, req.BusinessIDs); err != nil {
+	newIDs, err := h.enforceLimitWithAdd(c, tid, models.ProviderTikTok, req.BusinessIDs)
+	if err != nil {
 		return err
 	}
 
@@ -885,6 +991,12 @@ func (h *ChannelsHandler) TikTokOAuthConnect(c *fiber.Ctx) error {
 			return err
 		}
 		connected = append(connected, h.toView(conn))
+	}
+
+	// Race-safe verify: re-check the cap after inserting and roll back if a
+	// concurrent connect busted the limit.
+	if err := h.finalizeLimit(c, tid, models.ProviderTikTok, newIDs); err != nil {
+		return err
 	}
 
 	// Done with the state — kill it so the same handshake can't be replayed.
@@ -1010,7 +1122,8 @@ func (h *ChannelsHandler) WhatsAppOAuthConnect(c *fiber.Ctx) error {
 	}
 
 	// Pre-flight plan limit check.
-	if err := h.enforceLimitWithAdd(c, tid, models.ProviderWhatsApp, req.PhoneNumberIDs); err != nil {
+	newIDs, err := h.enforceLimitWithAdd(c, tid, models.ProviderWhatsApp, req.PhoneNumberIDs)
+	if err != nil {
 		return err
 	}
 
@@ -1064,6 +1177,12 @@ func (h *ChannelsHandler) WhatsAppOAuthConnect(c *fiber.Ctx) error {
 		connected = append(connected, h.toView(conn))
 	}
 
+	// Race-safe verify: re-check the cap after inserting and roll back if a
+	// concurrent connect busted the limit.
+	if err := h.finalizeLimit(c, tid, models.ProviderWhatsApp, newIDs); err != nil {
+		return err
+	}
+
 	_ = h.store.DeleteWAOAuthState(c.Context(), req.State)
 	return c.JSON(fiber.Map{"connections": connected})
 }
@@ -1088,7 +1207,11 @@ func (h *ChannelsHandler) LazadaOAuthStart(c *fiber.Ctx) error {
 	// Plan limit pre-check — Lazada has no picker so we can't enforce on
 	// the connect step; do it here instead. addCount=1 represents the
 	// single seller account the user is about to connect.
-	if err := h.enforceLimit(c, tid, models.ProviderLazada, ""); err != nil {
+	//
+	// Lazada has no picker: the connection is actually inserted later in the
+	// OAuth callback (LazadaOAuthCallback), which does its own insert-then-
+	// verify rollback. This is only the pre-flight gate, so we discard newIDs.
+	if _, err := h.enforceLimit(c, tid, models.ProviderLazada, ""); err != nil {
 		return err
 	}
 
@@ -1142,7 +1265,7 @@ func (h *ChannelsHandler) ConnectWeb(c *fiber.Ctx) error {
 	var req webConnectReq
 	_ = c.BodyParser(&req) // body is optional
 
-	if err := h.enforceLimit(c, tid, models.ProviderWeb, ""); err != nil {
+	if _, err := h.enforceLimit(c, tid, models.ProviderWeb, ""); err != nil {
 		return err
 	}
 
@@ -1174,6 +1297,12 @@ func (h *ChannelsHandler) ConnectWeb(c *fiber.Ctx) error {
 		CreatedBy:   uid,
 	}
 	if err := h.store.Upsert(c.Context(), conn); err != nil {
+		return err
+	}
+	// Race-safe verify: the widget id is freshly generated (always a new slot),
+	// so re-check the cap after insert and roll back if a concurrent connect
+	// pushed us over.
+	if err := h.finalizeLimit(c, tid, models.ProviderWeb, []string{widgetID}); err != nil {
 		return err
 	}
 

@@ -100,8 +100,11 @@ func (h *BusinessHoursHandler) Update(c *fiber.Ctx) error {
 			if !timeOfDayRe.MatchString(d.Open) || !timeOfDayRe.MatchString(d.Close) {
 				return fiber.NewError(fiber.StatusBadRequest, "open/close must be HH:MM")
 			}
-			if d.Open >= d.Close {
-				return fiber.NewError(fiber.StatusBadRequest, "open must be earlier than close")
+			// Open == Close is a zero-length (invalid) range. Open > Close is
+			// allowed: it represents an overnight range (e.g. 22:00–06:00) that
+			// spans midnight. Only equal times are rejected.
+			if d.Open == d.Close {
+				return fiber.NewError(fiber.StatusBadRequest, "open and close must differ")
 			}
 		}
 		days[i] = d

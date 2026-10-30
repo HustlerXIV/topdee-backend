@@ -135,6 +135,15 @@ type Config struct {
 	// e.g. "https://topdee.com"
 	AllowOrigins string
 
+	// RequireWebhookSignature — when true, inbound platform webhooks whose
+	// provider has NO signing secret configured are rejected (fail-closed).
+	// When false (the default, preserving historical behaviour) they are
+	// accepted but a loud warning is logged. Set WEBHOOK_REQUIRE_SIGNATURE=true
+	// in production once every connected provider's secret is configured.
+	// Note: this only affects the "no secret configured" path — when a secret
+	// IS set, signatures are always verified strictly regardless of this flag.
+	RequireWebhookSignature bool
+
 	// Cloudflare R2 — S3-compatible object storage for tenant logo uploads.
 	// Create a bucket + API token at dash.cloudflare.com → R2 → Manage R2 API Tokens.
 	// R2PublicURL is your bucket's public domain (enable "Public access" on the bucket
@@ -194,6 +203,8 @@ func Load() (*Config, error) {
 
 		AllowOrigins: getEnv("CORS_ALLOW_ORIGINS", "*"),
 
+		RequireWebhookSignature: getEnvBool("WEBHOOK_REQUIRE_SIGNATURE", false),
+
 		R2AccountID: getEnv("R2_ACCOUNT_ID", ""),
 		R2AccessKey: getEnv("R2_ACCESS_KEY", ""),
 		R2SecretKey: getEnv("R2_SECRET_KEY", ""),
@@ -229,6 +240,23 @@ func getEnv(k, def string) string {
 		return v
 	}
 	return def
+}
+
+// getEnvBool parses a boolean env var. Accepts 1/t/true/yes/on (any case) as
+// true; anything else (including unset/empty) yields the provided default.
+func getEnvBool(k string, def bool) bool {
+	v := strings.TrimSpace(strings.ToLower(os.Getenv(k)))
+	if v == "" {
+		return def
+	}
+	switch v {
+	case "1", "t", "true", "yes", "on":
+		return true
+	case "0", "f", "false", "no", "off":
+		return false
+	default:
+		return def
+	}
 }
 
 // getEnvOr returns the env var if set, otherwise the provided fallback.

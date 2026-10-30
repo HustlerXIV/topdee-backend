@@ -180,7 +180,7 @@ func (TikTokProvider) ParseEvents(body []byte) ([]ParsedEvent, error) {
 // production setups should always set it.
 func (TikTokProvider) VerifySignature(headers map[string]string, body []byte, cfg *config.Config, _ *models.ChannelConnection) bool {
 	if cfg.TTClientSecret == "" {
-		return true
+		return acceptUnverifiedWebhook(cfg, "tiktok")
 	}
 	sig := headerCI(headers, "TikTok-Signature")
 	if sig == "" {

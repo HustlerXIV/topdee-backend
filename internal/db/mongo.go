@@ -88,5 +88,40 @@ func (m *Mongo) ensureIndexes(ctx context.Context) error {
 	}); err != nil {
 		return err
 	}
+	// IG / TikTok / WhatsApp / Lazada each store their OAuth handshakes in a
+	// dedicated collection. Mirror the channel_oauth_states TTL so these
+	// short-lived state docs are auto-expired via expires_at as well.
+	for _, coll := range []string{
+		"channel_ig_oauth_states",
+		"channel_tt_oauth_states",
+		"channel_wa_oauth_states",
+		"channel_lz_oauth_states",
+	} {
+		if _, err := m.DB.Collection(coll).Indexes().CreateOne(ctx, mongo.IndexModel{
+			Keys:    bson.D{{Key: "expires_at", Value: 1}},
+			Options: options.Index().SetExpireAfterSeconds(0).SetName("ttl_expires_at"),
+		}); err != nil {
+			return err
+		}
+	}
+	// stripe_events — Stripe webhook idempotency ledger. Stripe retries for
+	// up to ~3 days, so 30-day retention is more than enough; the TTL keeps
+	// the collection from growing forever.
+	if _, err := m.DB.Collection("stripe_events").Indexes().CreateOne(ctx, mongo.IndexModel{
+		Keys:    bson.D{{Key: "created_at", Value: 1}},
+		Options: options.Index().SetExpireAfterSeconds(30 * 24 * 60 * 60).SetName("ttl_created_at"),
+	}); err != nil {
+		return err
+	}
+	// processed_events — inbound-webhook idempotency ledger (dedupes platform
+	// redeliveries). The _id IS the dedupe key so uniqueness is implicit; this
+	// TTL just bounds growth. Platform retries are short-lived, so 3 days is
+	// ample.
+	if _, err := m.DB.Collection("processed_events").Indexes().CreateOne(ctx, mongo.IndexModel{
+		Keys:    bson.D{{Key: "created_at", Value: 1}},
+		Options: options.Index().SetExpireAfterSeconds(3 * 24 * 60 * 60).SetName("ttl_created_at"),
+	}); err != nil {
+		return err
+	}
 	return nil
 }

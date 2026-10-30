@@ -203,19 +203,16 @@ func (h *ReferralHandler) SubmitPayoutRequest(c *fiber.Ctx) error {
 		return fiber.NewError(fiber.StatusBadRequest, "consent_given must be true")
 	}
 
-	// Load wallet.
-	var wallet models.Wallet
+	// Ensure a wallet exists (nicer error than "balance is zero").
 	if err := h.mongo.DB.Collection("wallets").
-		FindOne(c.Context(), bson.M{"_id": tid}).Decode(&wallet); err == mongo.ErrNoDocuments {
+		FindOne(c.Context(), bson.M{"_id": tid}).Err(); err == mongo.ErrNoDocuments {
 		return fiber.NewError(fiber.StatusBadRequest, "no wallet found — no commissions earned yet")
 	} else if err != nil {
 		return err
 	}
-	if wallet.Balance <= 0 {
-		return fiber.NewError(fiber.StatusBadRequest, "wallet balance is zero")
-	}
 
-	// Check there is no already-pending request.
+	// Check there is no already-pending request. (Best-effort; the atomic
+	// balance claim below is the real guard against concurrent double-submit.)
 	existing, _ := h.mongo.DB.Collection("payout_requests").CountDocuments(
 		c.Context(), bson.M{"tenant_id": tid, "status": models.PayoutRequestStatusPending},
 	)
@@ -224,9 +221,27 @@ func (h *ReferralHandler) SubmitPayoutRequest(c *fiber.Ctx) error {
 	}
 
 	now := time.Now().UTC()
-	amount := wallet.Balance
 
-	// Deduct from wallet immediately (hold).
+	// Atomically claim the entire balance in one operation. The filter
+	// `balance > 0` guarantees that two concurrent requests can't both drain
+	// the wallet — the second matches nothing. FindOneAndUpdate returns the
+	// document as it was BEFORE the update, so `claimed.Balance` is the amount
+	// we just held. Using this instead of a read-then-$set:0 also avoids
+	// silently destroying commission credited between the read and the write.
+	var claimed models.Wallet
+	err := h.mongo.DB.Collection("wallets").FindOneAndUpdate(
+		c.Context(),
+		bson.M{"_id": tid, "balance": bson.M{"$gt": 0}},
+		bson.M{"$set": bson.M{"balance": 0, "updated_at": now}},
+	).Decode(&claimed)
+	if err == mongo.ErrNoDocuments {
+		return fiber.NewError(fiber.StatusBadRequest, "wallet balance is zero")
+	} else if err != nil {
+		return err
+	}
+	amount := claimed.Balance
+
+	// Record the hold transaction. If this fails, refund the claim.
 	txn := models.WalletTransaction{
 		ID:          uuid.NewString(),
 		TenantID:    tid,
@@ -236,17 +251,12 @@ func (h *ReferralHandler) SubmitPayoutRequest(c *fiber.Ctx) error {
 		CreatedAt:   now,
 	}
 	if _, err := h.mongo.DB.Collection("wallet_transactions").InsertOne(c.Context(), txn); err != nil {
-		return err
-	}
-	if _, err := h.mongo.DB.Collection("wallets").UpdateOne(
-		c.Context(),
-		bson.M{"_id": tid},
-		bson.M{"$set": bson.M{"balance": 0, "updated_at": now}},
-	); err != nil {
+		_, _ = h.mongo.DB.Collection("wallets").UpdateOne(c.Context(),
+			bson.M{"_id": tid}, bson.M{"$inc": bson.M{"balance": amount}})
 		return err
 	}
 
-	// Create the payout request record.
+	// Create the payout request record. If this fails, unwind the hold.
 	pr := models.PayoutRequest{
 		ID:            uuid.NewString(),
 		TenantID:      tid,
@@ -264,6 +274,12 @@ func (h *ReferralHandler) SubmitPayoutRequest(c *fiber.Ctx) error {
 		UpdatedAt:     now,
 	}
 	if _, err := h.mongo.DB.Collection("payout_requests").InsertOne(c.Context(), pr); err != nil {
+		// Unwind: refund the held balance and remove the hold transaction so
+		// the tenant isn't left with money deducted but no payout request.
+		_, _ = h.mongo.DB.Collection("wallets").UpdateOne(c.Context(),
+			bson.M{"_id": tid}, bson.M{"$inc": bson.M{"balance": amount}})
+		_, _ = h.mongo.DB.Collection("wallet_transactions").DeleteOne(c.Context(),
+			bson.M{"_id": txn.ID})
 		return err
 	}
 
@@ -308,7 +324,15 @@ var nonAlpha = regexp.MustCompile(`[^A-Z0-9]`)
 // generateUniqueCode creates a human-readable referral code like "NAPAT24".
 // It strips non-ASCII letters, uppercases, takes up to 5 chars from the
 // tenant name, and appends the 2-digit year. Appends a numeric suffix on collision.
-func generateUniqueCode(ctx interface{ Done() <-chan struct{} }, m *db.Mongo, tenantName string) (string, error) {
+func generateUniqueCode(ctx context.Context, m *db.Mongo, tenantName string) (string, error) {
+	// Derive a bounded context so the uniqueness lookups can't hang and always
+	// carry a valid, non-nil context to the driver.
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
 	// Extract ASCII letters only, uppercase.
 	var letters []rune
 	for _, r := range tenantName {
@@ -333,17 +357,10 @@ func generateUniqueCode(ctx interface{ Done() <-chan struct{} }, m *db.Mongo, te
 		}
 		// Check uniqueness.
 		count, err := m.DB.Collection("referral_codes").CountDocuments(
-			nil, bson.M{"_id": code},
+			ctx, bson.M{"_id": code},
 		)
 		if err != nil {
-			// If context is nil, try without it.
-			count2, e2 := m.DB.Collection("referral_codes").CountDocuments(
-				nil, bson.M{"_id": code},
-			)
-			if e2 != nil {
-				return "", e2
-			}
-			count = count2
+			return "", err
 		}
 		if count == 0 {
 			return strings.ToUpper(nonAlpha.ReplaceAllString(code, "")), nil

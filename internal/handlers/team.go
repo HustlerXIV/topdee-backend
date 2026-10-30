@@ -30,6 +30,7 @@ import (
 	"golang.org/x/crypto/bcrypt"
 
 	"github.com/topdee/backend/internal/auth"
+	"github.com/topdee/backend/internal/channels"
 	"github.com/topdee/backend/internal/config"
 	"github.com/topdee/backend/internal/db"
 	"github.com/topdee/backend/internal/email"
@@ -222,6 +223,33 @@ func (h *TeamHandler) CreateInvite(c *fiber.Ctx) error {
 		}
 		return fiber.NewError(fiber.StatusConflict,
 			"this email already has a Topdee account on another workspace — multi-workspace support is coming soon")
+	}
+
+	// Enforce the plan's team-member (seat) limit. A seat is used by each
+	// existing member plus each outstanding pending invite. Re-inviting an
+	// email that already has a pending invite doesn't consume an extra seat
+	// (the old invite is revoked below), so we exclude it from the count.
+	// -1 = unlimited; only a positive cap is enforced.
+	plan := tenantPlan(c.Context(), h.mongo, tid)
+	if seatLimit := channels.MemberLimitForCtx(c.Context(), h.mongo.DB, plan); seatLimit > 0 {
+		members, err := h.mongo.DB.Collection("users").CountDocuments(c.Context(),
+			bson.M{"tenant_id": tid})
+		if err != nil {
+			return err
+		}
+		pending, err := h.mongo.DB.Collection("team_invites").CountDocuments(c.Context(),
+			bson.M{
+				"tenant_id": tid,
+				"status":    models.InviteStatusPending,
+				"email":     bson.M{"$ne": req.Email},
+			})
+		if err != nil {
+			return err
+		}
+		if members+pending >= int64(seatLimit) {
+			return fiber.NewError(fiber.StatusForbidden,
+				"team member limit reached for your plan — upgrade to invite more")
+		}
 	}
 
 	// Look up workspace name for the email subject + body.

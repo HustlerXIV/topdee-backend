@@ -123,6 +123,35 @@ func LimitForCtx(ctx context.Context, db *mongo.Database, plan, provider string)
 	return limitFallback(plan, provider)
 }
 
+// KnowledgeBaseLimitForCtx returns the max knowledge bases allowed for a plan.
+// -1 means unlimited. Returns -1 (unlimited) when the plans collection is
+// unavailable so a config gap never blocks legitimate use.
+func KnowledgeBaseLimitForCtx(ctx context.Context, db *mongo.Database, plan string) int {
+	if db != nil {
+		tctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+		defer cancel()
+		var doc planDoc
+		if err := db.Collection("plans").FindOne(tctx, bson.M{"_id": plan}).Decode(&doc); err == nil {
+			return doc.Limits.KnowledgeBases
+		}
+	}
+	return -1
+}
+
+// StorageMBLimitForCtx returns the file-storage cap in MB for a plan. -1 means
+// unlimited. Returns -1 (unlimited) when the plans collection is unavailable.
+func StorageMBLimitForCtx(ctx context.Context, db *mongo.Database, plan string) int {
+	if db != nil {
+		tctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+		defer cancel()
+		var doc planDoc
+		if err := db.Collection("plans").FindOne(tctx, bson.M{"_id": plan}).Decode(&doc); err == nil {
+			return doc.Limits.StorageMB
+		}
+	}
+	return -1
+}
+
 // MemberLimitForCtx returns the max team members allowed for a plan.
 func MemberLimitForCtx(ctx context.Context, db *mongo.Database, plan string) int {
 	if db != nil {

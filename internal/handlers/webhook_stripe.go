@@ -27,7 +27,9 @@ import (
 	"time"
 
 	"github.com/gofiber/fiber/v2"
+	"github.com/google/uuid"
 	"github.com/stripe/stripe-go/v79"
+	stripecharge "github.com/stripe/stripe-go/v79/charge"
 	stripepaymentintent "github.com/stripe/stripe-go/v79/paymentintent"
 	stripesub "github.com/stripe/stripe-go/v79/subscription"
 	"github.com/stripe/stripe-go/v79/webhook"
@@ -63,6 +65,29 @@ func StripeWebhook(mongo *db.Mongo, cfg *config.Config) fiber.Handler {
 		ctx, cancel := context.WithTimeout(c.Context(), 15*time.Second)
 		defer cancel()
 
+		// ── Idempotency claim ────────────────────────────────────────────
+		// Stripe delivers events at-least-once (redelivery on slow ack,
+		// retries, etc.). Several handlers here have side effects that are
+		// NOT naturally idempotent — most importantly crediting referral
+		// commission with an unconditional $inc. We claim each event id in
+		// `stripe_events`; a duplicate delivery finds it already claimed and
+		// is skipped. If the handler later fails, we release the claim so
+		// Stripe's retry can reprocess it.
+		claim, cerr := mongo.DB.Collection("stripe_events").UpdateOne(ctx,
+			bson.M{"_id": event.ID},
+			bson.M{"$setOnInsert": bson.M{"type": string(event.Type), "created_at": time.Now().UTC()}},
+			options.Update().SetUpsert(true),
+		)
+		if cerr != nil {
+			// Can't guarantee dedupe → fail so Stripe retries rather than
+			// risk double-processing.
+			return fiber.NewError(fiber.StatusInternalServerError, "dedupe claim: "+cerr.Error())
+		}
+		if claim.UpsertedCount == 0 {
+			log.Printf("[stripe webhook] duplicate event %s (%s), skipping", event.ID, event.Type)
+			return c.SendStatus(fiber.StatusOK)
+		}
+
 		// Dispatch. Returning nil here means we 200 the event; Stripe
 		// won't retry. Errors trigger a Stripe retry — only return error
 		// for truly transient issues (DB down), not malformed data.
@@ -77,6 +102,12 @@ func StripeWebhook(mongo *db.Mongo, cfg *config.Config) fiber.Handler {
 			err = handleInvoicePaid(ctx, mongo, event)
 		case "invoice.payment_failed":
 			err = handleInvoiceFailed(ctx, mongo, event)
+		case "charge.refunded":
+			err = handleChargeRefunded(ctx, mongo, event)
+		case "charge.dispute.created":
+			err = handleChargeDisputeCreated(ctx, mongo, event)
+		case "checkout.session.async_payment_failed":
+			err = handleAsyncPaymentFailed(ctx, mongo, event)
 		default:
 			// Unhandled event types are still 200 — Stripe sends a lot
 			// of stuff we don't care about (price.updated, etc).
@@ -84,6 +115,9 @@ func StripeWebhook(mongo *db.Mongo, cfg *config.Config) fiber.Handler {
 		}
 
 		if err != nil {
+			// Release the idempotency claim so Stripe's retry reprocesses this
+			// event; otherwise a transient failure would drop it permanently.
+			_, _ = mongo.DB.Collection("stripe_events").DeleteOne(ctx, bson.M{"_id": event.ID})
 			log.Printf("[stripe webhook] %s: %v", event.Type, err)
 			return fiber.NewError(fiber.StatusInternalServerError, err.Error())
 		}
@@ -219,6 +253,8 @@ func handleCheckoutCompleted(ctx context.Context, mongo *db.Mongo, ev stripe.Eve
 		// UpsertedCount==1 means this is the first time we've seen this session
 		// (idempotency guard — SyncCheckoutSession may have already processed it).
 		if payResult != nil && payResult.UpsertedCount > 0 {
+			// Resume a paused referral before crediting (see handleInvoicePaid).
+			setReferralStatusBestEffort(ctx, mongo, t.ID, models.ReferralStatusPaused, models.ReferralStatusActive, "promptpay paid")
 			go creditReferralCommission(mongo, t)
 		}
 
@@ -228,6 +264,15 @@ func handleCheckoutCompleted(ctx context.Context, mongo *db.Mongo, ev stripe.Eve
 	// ── Card / subscription mode ──────────────────────────────────────────────
 	if sess.Subscription == nil {
 		return nil // unrecognised mode — ignore
+	}
+
+	// Guard: don't seed the plan as active when the checkout is explicitly
+	// unpaid. For subscription mode Stripe normally sets payment_status="paid"
+	// (or leaves it empty in some payloads), so we only bail on an explicit
+	// "unpaid" — the subscription lifecycle webhooks will grant access once the
+	// first invoice is actually collected.
+	if sess.PaymentStatus == stripe.CheckoutSessionPaymentStatusUnpaid {
+		return nil
 	}
 
 	updates := bson.M{
@@ -324,6 +369,9 @@ func handleSubscriptionDeleted(ctx context.Context, mongo *db.Mongo, ev stripe.E
 			"plan":                   "free", // auto-downgrade when subscription ends
 		}},
 	)
+	// Pause the referral so no further commissions accrue while this tenant is
+	// canceled; it resumes on their next successful payment.
+	setReferralStatusBestEffort(ctx, mongo, t.ID, models.ReferralStatusActive, models.ReferralStatusPaused, "subscription canceled")
 	return err
 }
 
@@ -363,9 +411,19 @@ func handleInvoicePaid(ctx context.Context, m *db.Mongo, ev stripe.Event) error 
 	}
 
 	// ── Referral commission ───────────────────────────────────────────
+	// Only pay commission on invoices that actually collected money. Stripe
+	// emits invoice.payment_succeeded for ฿0 invoices too (trial-start
+	// invoices, 100%-off coupons) — those must not generate real commission.
 	// Fire-and-forget: a commission error must never fail the webhook
 	// (Stripe would retry, causing duplicate subscription updates).
-	go creditReferralCommission(m, t)
+	if inv.AmountPaid > 0 {
+		// Resume a paused referral BEFORE crediting: creditReferralCommission
+		// only matches status=active, so the flip must land first. This does not
+		// double-credit — crediting is separate and guarded by AmountPaid>0 and
+		// the event-ID idempotency in the dispatcher.
+		setReferralStatusBestEffort(ctx, m, t.ID, models.ReferralStatusPaused, models.ReferralStatusActive, "invoice paid")
+		go creditReferralCommission(m, t)
+	}
 
 	return nil
 }
@@ -451,7 +509,216 @@ func handleInvoiceFailed(ctx context.Context, mongo *db.Mongo, ev stripe.Event) 
 		bson.M{"_id": t.ID},
 		bson.M{"$set": bson.M{"subscription": merged}},
 	)
+	// Pause the referral while the account is past_due (no commission on money
+	// we didn't collect). It resumes on the next successful payment. The plan
+	// itself is NOT downgraded here — dunning may recover; ExpireSubscriptions
+	// handles the downgrade once the grace period lapses.
+	setReferralStatusBestEffort(ctx, mongo, t.ID, models.ReferralStatusActive, models.ReferralStatusPaused, "invoice payment failed")
 	return err
+}
+
+// handleChargeRefunded revokes access when a charge is fully refunded and
+// claws back any referral commission that was paid on it. Partial refunds are
+// ignored (the customer keeps what they partly paid for). This is the main
+// protection for PromptPay one-time payments, where a refund would otherwise
+// leave the tenant on the paid plan for the full period.
+func handleChargeRefunded(ctx context.Context, mongo *db.Mongo, ev stripe.Event) error {
+	var ch stripe.Charge
+	if err := json.Unmarshal(ev.Data.Raw, &ch); err != nil {
+		return err
+	}
+	// Only act on a full refund; a partial refund keeps the plan.
+	if !ch.Refunded && ch.AmountRefunded < ch.Amount {
+		return nil
+	}
+	if ch.Customer == nil {
+		return nil
+	}
+	t, err := findTenantByCustomer(ctx, mongo, ch.Customer.ID)
+	if err != nil || t == nil {
+		return err
+	}
+	return revokeAccessAndReverseCommission(ctx, mongo, t, "charge refunded")
+}
+
+// handleChargeDisputeCreated treats a new dispute (chargeback) like a refund:
+// the customer is challenging the payment, so access is revoked and commission
+// is reversed. The dispute's charge often doesn't carry the customer inline in
+// the webhook payload, so we fetch the charge when needed.
+func handleChargeDisputeCreated(ctx context.Context, mongo *db.Mongo, ev stripe.Event) error {
+	var dp stripe.Dispute
+	if err := json.Unmarshal(ev.Data.Raw, &dp); err != nil {
+		return err
+	}
+	var customerID string
+	if dp.Charge != nil {
+		if dp.Charge.Customer != nil {
+			customerID = dp.Charge.Customer.ID
+		} else if dp.Charge.ID != "" {
+			if ch, cerr := stripecharge.Get(dp.Charge.ID, nil); cerr == nil && ch.Customer != nil {
+				customerID = ch.Customer.ID
+			}
+		}
+	}
+	if customerID == "" {
+		return nil
+	}
+	t, err := findTenantByCustomer(ctx, mongo, customerID)
+	if err != nil || t == nil {
+		return err
+	}
+	return revokeAccessAndReverseCommission(ctx, mongo, t, "payment disputed")
+}
+
+// handleAsyncPaymentFailed fires when a delayed payment method (e.g. PromptPay)
+// ultimately fails after checkout. We mark the payment record failed. We do NOT
+// downgrade the plan here: the completed-handler only grants a PromptPay plan
+// once payment_status=paid, so a failed async payment was never granted — and
+// blindly downgrading could wrongly cut off a tenant who still has a separate
+// active plan.
+func handleAsyncPaymentFailed(ctx context.Context, mongo *db.Mongo, ev stripe.Event) error {
+	var sess stripe.CheckoutSession
+	if err := json.Unmarshal(ev.Data.Raw, &sess); err != nil {
+		return err
+	}
+	if sess.ID == "" {
+		return nil
+	}
+	_, _ = mongo.DB.Collection("payments").UpdateOne(ctx,
+		bson.M{"_id": sess.ID},
+		bson.M{"$set": bson.M{"status": "failed"}},
+	)
+	log.Printf("[stripe webhook] async payment failed for session=%s", sess.ID)
+	return nil
+}
+
+// revokeAccessAndReverseCommission is shared by the refund + dispute handlers.
+// It downgrades one-time (PromptPay) grants to free, reverses any referral
+// commission that was paid, and marks the most recent paid payment refunded.
+//
+// Card subscribers (stripe_subscription_id set) are intentionally NOT force-
+// downgraded here — their access is governed by the subscription lifecycle
+// (customer.subscription.updated/deleted); a single refunded/disputed invoice
+// shouldn't necessarily sever an otherwise-active recurring subscription.
+func revokeAccessAndReverseCommission(ctx context.Context, mongo *db.Mongo, t *models.Tenant, reason string) error {
+	now := time.Now().UTC()
+
+	if t.StripeSubscriptionID == "" {
+		merged := mergedSubscription(t.Subscription)
+		merged.Status = models.SubStatusCanceled
+		merged.CanceledAt = &now
+		merged.CancelAtPeriodEnd = false
+		merged.UpdatedAt = now
+		if _, err := mongo.DB.Collection("tenants").UpdateOne(ctx,
+			bson.M{"_id": t.ID},
+			bson.M{"$set": bson.M{
+				"subscription": merged,
+				"plan":         "free",
+			}},
+		); err != nil {
+			return err
+		}
+		log.Printf("[stripe webhook] revoked access for tenant=%s (%s)", t.ID, reason)
+	}
+
+	// Mark the tenant's most recent paid payment as refunded (best-effort).
+	_ = mongo.DB.Collection("payments").FindOneAndUpdate(ctx,
+		bson.M{"tenant_id": t.ID, "status": "paid"},
+		bson.M{"$set": bson.M{"status": "refunded"}},
+		options.FindOneAndUpdate().SetSort(bson.D{{Key: "created_at", Value: -1}}),
+	).Err()
+
+	// Claw back the referral commission that was paid on this revenue.
+	reverseReferralCommission(mongo, t, reason)
+	return nil
+}
+
+// reverseReferralCommission reverses the most recent commission credited for a
+// referred tenant when its payment is refunded/disputed. The wallet is clamped
+// at zero (the referrer may have already withdrawn), and referral stats are
+// rolled back. Best-effort: failures are logged, never fatal to the webhook.
+func reverseReferralCommission(m *db.Mongo, t *models.Tenant, reason string) {
+	if t.ReferralCodeUsed == "" {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	var referral models.Referral
+	if err := m.DB.Collection("referrals").
+		FindOne(ctx, bson.M{"referred_tenant_id": t.ID}).Decode(&referral); err != nil {
+		return
+	}
+
+	// Most recent commission credit for this referral (positive amount).
+	var lastCredit models.WalletTransaction
+	if err := m.DB.Collection("wallet_transactions").FindOne(ctx,
+		bson.M{"referral_id": referral.ID, "type": models.TxnTypeCommission, "amount": bson.M{"$gt": 0}},
+		options.FindOne().SetSort(bson.D{{Key: "created_at", Value: -1}}),
+	).Decode(&lastCredit); err != nil {
+		return // nothing to reverse
+	}
+	amount := lastCredit.Amount
+	if amount <= 0 {
+		return
+	}
+
+	now := time.Now().UTC()
+
+	// Clamp the deduction so the wallet never goes negative.
+	var wallet models.Wallet
+	_ = m.DB.Collection("wallets").FindOne(ctx, bson.M{"_id": referral.ReferrerTenantID}).Decode(&wallet)
+	deduct := amount
+	if wallet.Balance < deduct {
+		deduct = wallet.Balance
+	}
+	if deduct > 0 {
+		_, _ = m.DB.Collection("wallets").UpdateOne(ctx,
+			bson.M{"_id": referral.ReferrerTenantID},
+			bson.M{"$inc": bson.M{"balance": -deduct}, "$set": bson.M{"updated_at": now}},
+		)
+	}
+
+	txn := models.WalletTransaction{
+		ID:          uuid.NewString(),
+		TenantID:    referral.ReferrerTenantID,
+		Type:        models.TxnTypeCommissionReversal,
+		Amount:      -amount,
+		ReferralID:  referral.ID,
+		Description: fmt.Sprintf("Commission reversed (%s) — %s", reason, referral.ReferredTenantName),
+		CreatedAt:   now,
+	}
+	if _, err := m.DB.Collection("wallet_transactions").InsertOne(ctx, txn); err != nil {
+		log.Printf("[referral] reversal txn: %v", err)
+	}
+
+	_, _ = m.DB.Collection("referrals").UpdateOne(ctx,
+		bson.M{"_id": referral.ID},
+		bson.M{
+			"$inc": bson.M{"commission_count": -1, "total_earned": -amount},
+			"$set": bson.M{"updated_at": now},
+		},
+	)
+}
+
+// setReferralStatusBestEffort transitions a referred tenant's referral record
+// from one status to another — active→paused when they lapse (cancel/past_due)
+// so no further commissions accrue, and paused→active when they pay again so
+// future commissions resume. It only flips the gating status; it never
+// credits/debits money (that is handled separately and already guarded against
+// double-crediting). Best-effort: errors are logged, never fatal to the webhook.
+func setReferralStatusBestEffort(ctx context.Context, mongo *db.Mongo, tenantID, from, to, reason string) {
+	res, err := mongo.DB.Collection("referrals").UpdateOne(ctx,
+		bson.M{"referred_tenant_id": tenantID, "status": from},
+		bson.M{"$set": bson.M{"status": to, "updated_at": time.Now().UTC()}},
+	)
+	if err != nil {
+		log.Printf("[referral] status %s→%s tenant=%s (%s): %v", from, to, tenantID, reason, err)
+		return
+	}
+	if res.ModifiedCount > 0 {
+		log.Printf("[referral] status %s→%s tenant=%s (%s)", from, to, tenantID, reason)
+	}
 }
 
 // ── helpers ────────────────────────────────────────────────────────────
@@ -511,11 +778,18 @@ func syncSubscription(ctx context.Context, mongo *db.Mongo, tenantID string, sub
 	merged.CancelAtPeriodEnd = sub.CancelAtPeriodEnd
 	merged.UpdatedAt = time.Now().UTC()
 
-	// Resolve the plan slug — check subscription metadata first (set by our
-	// checkout session), then fall back to price metadata.
-	planSlug := sub.Metadata["plan"]
-	if planSlug == "" && sub.Items != nil && len(sub.Items.Data) > 0 && sub.Items.Data[0].Price != nil {
+	// Resolve the plan slug. On a Customer Portal plan change Stripe does NOT
+	// update the subscription's own metadata["plan"] — it keeps whatever we set
+	// at the original checkout, so it can go stale. The line item's Price
+	// metadata always reflects the CURRENT price, so prefer a non-empty price
+	// metadata plan and only fall back to subscription metadata when the price
+	// carries no slug. This keeps portal upgrades/downgrades in sync.
+	planSlug := ""
+	if sub.Items != nil && len(sub.Items.Data) > 0 && sub.Items.Data[0].Price != nil {
 		planSlug = sub.Items.Data[0].Price.Metadata["plan"]
+	}
+	if planSlug == "" {
+		planSlug = sub.Metadata["plan"]
 	}
 
 	updates := bson.M{

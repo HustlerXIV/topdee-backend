@@ -17,6 +17,8 @@ package handlers
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"log"
 	"net/url"
@@ -27,6 +29,8 @@ import (
 	"github.com/gofiber/fiber/v2"
 
 	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/mongo"
+	"go.mongodb.org/mongo-driver/mongo/options"
 
 	"github.com/topdee/backend/internal/channels"
 	"github.com/topdee/backend/internal/config"
@@ -156,6 +160,18 @@ func processEvents(
 		for _, evt := range batch {
 			conversationID := fmt.Sprintf("%s:%s:%s", p.Name(), externalID, evt.ExternalUserID)
 
+			// Idempotency guard. Platforms redeliver webhooks aggressively —
+			// LINE and Meta both retry on any non-2xx, and occasionally
+			// re-POST an event even after we 200'd it. Without a dedupe check a
+			// redelivery double-runs the AI turn (second reply to the customer)
+			// and double-burns quota. Claim the event before ANY stateful work
+			// so a duplicate is dropped here. Covers both the normal inbound
+			// path and agent echoes.
+			if !claimInboundEvent(ctx, m, dedupeKey(p.Name(), evt)) {
+				log.Printf("webhook %s: duplicate event skipped conv=%s", p.Name(), conversationID)
+				continue
+			}
+
 			// Agent echo: a message the page sent, delivered back to us via
 			// message_echoes. If it came from OUR own app (bot reply or a
 			// dashboard human reply, both dispatched via the Send API) it's
@@ -207,6 +223,75 @@ func processEvents(
 		}
 		cancel()
 	}
+}
+
+// dedupeKey builds a best-effort idempotency key for one inbound event.
+//
+// No provider currently propagates a stable platform message id up to
+// ParsedEvent — LINE's message.id and Facebook's mid are both dropped during
+// parsing, and ParsedEvent.Raw is never populated — so we can't key on the
+// authoritative id without changing the provider layer. Instead we hash the
+// fields we DO have: provider + channel + sender + second-granularity
+// timestamp + a content hash (text + attachment ids/urls) + the echo flag.
+//
+// Tradeoff: this collapses genuine platform redeliveries (which repeat the
+// byte-identical payload, so every component matches) while keeping
+// false-positives rare — two DISTINCT messages would have to share the same
+// sender, the same wall-clock second AND identical content to be wrongly
+// merged. Second granularity + sender + content make that unlikely in
+// practice. The echo flag prevents a customer message and an agent echo with
+// coincidentally identical text/second from colliding.
+func dedupeKey(provider string, evt channels.ParsedEvent) string {
+	var b strings.Builder
+	b.WriteString(evt.Text)
+	for _, a := range evt.Attachments {
+		b.WriteByte('\n')
+		b.WriteString(a.ID)
+		b.WriteByte('|')
+		b.WriteString(a.URL)
+	}
+	sum := sha256.Sum256([]byte(b.String()))
+	echo := "0"
+	if evt.IsAgentEcho {
+		echo = "1"
+	}
+	return fmt.Sprintf("%s|%s|%s|%d|%s|%s",
+		provider, evt.ExternalChannelID, evt.ExternalUserID,
+		evt.Timestamp.Unix(), echo, hex.EncodeToString(sum[:]))
+}
+
+// claimInboundEvent atomically records an event in `processed_events` so
+// redeliveries are dropped. Returns true if THIS call won the claim (first
+// sighting → process it), false if it was already claimed (duplicate → skip).
+//
+// The claim is a single upsert keyed on the dedupe key as _id, so it's atomic
+// even under concurrent redeliveries: exactly one insert wins (UpsertedCount>0)
+// and any racing duplicate either matches the existing doc (UpsertedCount==0)
+// or trips the _id unique constraint (duplicate-key error → also a dupe).
+//
+// On any OTHER DB error we fail OPEN (return true) — a transient Mongo hiccup
+// must never silently swallow a real customer message; at worst we lose dedupe
+// protection for that one event, which is the pre-existing behavior.
+//
+// The collection is created lazily by this upsert; no index is required for
+// correctness. Follow-up: add a unique index on _id (implicit) plus a TTL on
+// created_at to `db/mongo.go` so the ledger doesn't grow unbounded.
+func claimInboundEvent(ctx context.Context, m *db.Mongo, key string) bool {
+	res, err := m.DB.Collection("processed_events").UpdateOne(
+		ctx,
+		bson.M{"_id": key},
+		bson.M{"$setOnInsert": bson.M{"created_at": time.Now()}},
+		options.Update().SetUpsert(true),
+	)
+	if err != nil {
+		if mongo.IsDuplicateKeyError(err) {
+			// Lost the race to a concurrent delivery of the same event.
+			return false
+		}
+		log.Printf("webhook: dedupe claim error (fail-open): %v", err)
+		return true
+	}
+	return res.UpsertedCount > 0
 }
 
 // broadcastInboxUpdate recomputes the unread count for a tenant and pushes
@@ -611,10 +696,46 @@ func LazadaOAuthCallback(store *channels.Store, m *db.Mongo, cfg *config.Config)
 			Status:    models.ChannelStatusActive,
 			CreatedBy: st.UserID,
 		}
+		// Insert-then-verify (race-safe cap enforcement). Lazada has no picker,
+		// so the plan-limit pre-check happens back in LazadaOAuthStart — but two
+		// concurrent OAuth flows can both pass that check and both land here,
+		// busting the cap. Detect whether this seller was already connected to
+		// this tenant (a reconnect, which never counts) so we only roll back a
+		// genuinely-new connection below.
+		wasReconnect := false
+		if existing, _ := store.FindByExternal(c.Context(), models.ProviderLazada, sellerID); existing != nil && existing.TenantID == st.TenantID {
+			wasReconnect = true
+		}
+
 		if err := store2.Upsert(c.Context(), conn); err != nil {
 			log.Printf("lz oauth: upsert: %v", err)
 			_ = store.DeleteLZOAuthState(c.Context(), state)
 			return c.Redirect(cfg.FrontendBaseURL+"/channels?lz_oauth=error&reason=upsert_failed", fiber.StatusFound)
+		}
+
+		// Re-check the cap now that the connection exists; roll it back if a
+		// concurrent connect pushed the tenant over the limit.
+		if !wasReconnect {
+			plan := tenantPlan(c.Context(), m, st.TenantID)
+			policy := channels.PolicyForCtx(c.Context(), m.DB, plan)
+			over := false
+			if policy.IsTotalMode() {
+				if used, err := store.CountByTenant(c.Context(), st.TenantID); err == nil {
+					over = policy.Total >= 0 && int(used) > policy.Total
+				}
+			} else {
+				limit := channels.LimitForCtx(c.Context(), m.DB, plan, models.ProviderLazada)
+				if used, err := store.CountByProvider(c.Context(), st.TenantID, models.ProviderLazada); err == nil {
+					over = limit >= 0 && int(used) > limit
+				}
+			}
+			if over {
+				if existing, _ := store.FindByExternal(c.Context(), models.ProviderLazada, sellerID); existing != nil && existing.TenantID == st.TenantID {
+					_, _ = store.Delete(c.Context(), st.TenantID, existing.ID)
+				}
+				_ = store.DeleteLZOAuthState(c.Context(), state)
+				return c.Redirect(cfg.FrontendBaseURL+"/channels?lz_oauth=error&reason=limit_reached", fiber.StatusFound)
+			}
 		}
 
 		_ = store.DeleteLZOAuthState(c.Context(), state)

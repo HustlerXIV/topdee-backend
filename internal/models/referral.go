@@ -104,9 +104,10 @@ type Wallet struct {
 // Immutable audit record of every balance movement.
 
 const (
-	TxnTypeCommission    = "commission"     // referral commission credited
-	TxnTypePayout        = "payout"         // manual cash payout by admin
-	TxnTypeCreditApplied = "credit_applied" // balance applied toward own Stripe invoice
+	TxnTypeCommission         = "commission"          // referral commission credited
+	TxnTypeCommissionReversal = "commission_reversal" // commission clawed back (refund/dispute)
+	TxnTypePayout             = "payout"              // manual cash payout by admin
+	TxnTypeCreditApplied      = "credit_applied"      // balance applied toward own Stripe invoice
 )
 
 type WalletTransaction struct {

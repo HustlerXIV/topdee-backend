@@ -115,6 +115,11 @@ func (h *GoogleAuthHandler) Callback(c *fiber.Ctx) error {
 	if profile.Email == "" {
 		return c.Redirect(frontendCallback+"?error=no_email", fiber.StatusTemporaryRedirect)
 	}
+	// Reject unverified Google emails before creating/matching a user —
+	// prevents account takeover via an unverified address.
+	if !profile.EmailVerified {
+		return c.Redirect(frontendCallback+"?error=email_not_verified", fiber.StatusTemporaryRedirect)
+	}
 
 	// ── Find or create user ───────────────────────────────────────────
 	token, isNew, err := h.findOrCreateUser(c.Context(), profile)

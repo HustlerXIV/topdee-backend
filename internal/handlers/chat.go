@@ -262,6 +262,18 @@ func (o *Orchestrator) HandleIncoming(
 		return "", nil, conversationID, nil
 	}
 
+	// ── Human-handoff gate ────────────────────────────────────────────────────
+	// If this conversation is flagged needs_human (the AI previously couldn't
+	// answer, or the customer asked for a person), a team member is handling it
+	// via the dashboard. We still saved the inbound message above so the inbox
+	// stays live, but we must NOT run an AI turn — otherwise the bot talks over
+	// the human agent mid-conversation (e.g. during a refund or complaint).
+	// The AI resumes automatically once the agent resolves the handoff
+	// (InboxHandler.ResolveHandoff clears needs_human). Playground is exempt.
+	if channel != models.ChannelDashboard && o.conversationNeedsHuman(ctx, tenantID, conversationID) {
+		return "", nil, conversationID, nil
+	}
+
 	// ── Monthly AI quota gate ─────────────────────────────────────────────────
 	// Only enforced on real customer channels (not the dashboard playground).
 	// Human-agent replies come through InboxHandler.SendMessage and never
@@ -470,6 +482,22 @@ func shouldHandoff(customerMsg, aiReply string) bool {
 // immediately broadcasts an inbox_update so the sidebar badge refreshes.
 // The "AI couldn't answer" email is sent only the FIRST time needs_human is
 // set for this conversation (deduplicated: if already true, email is skipped).
+// conversationNeedsHuman reports whether a conversation is currently flagged
+// for human handling (needs_human=true). Used by HandleIncoming to pause AI
+// auto-replies while a team member is on the conversation. A missing
+// conversation doc means it was never flagged, so the AI handles it normally.
+func (o *Orchestrator) conversationNeedsHuman(ctx context.Context, tenantID, conversationID string) bool {
+	var conv struct {
+		NeedsHuman bool `bson:"needs_human"`
+	}
+	if err := o.mongo.DB.Collection("conversations").
+		FindOne(ctx, bson.M{"_id": conversationID, "tenant_id": tenantID}).
+		Decode(&conv); err != nil {
+		return false
+	}
+	return conv.NeedsHuman
+}
+
 func (o *Orchestrator) flagHandoff(tenantID, conversationID string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -722,7 +750,13 @@ func businessHoursHint(bh *models.BusinessHours) string {
 	}
 	loc, err := time.LoadLocation(bh.Timezone)
 	if err != nil || loc == nil {
-		loc = time.UTC
+		// This is a Thai-market product; when the stored timezone is invalid
+		// fall back to Bangkok rather than UTC so "open now" stays correct.
+		if bkk, bkkErr := time.LoadLocation("Asia/Bangkok"); bkkErr == nil && bkk != nil {
+			loc = bkk
+		} else {
+			loc = time.UTC
+		}
 	}
 	now := time.Now().In(loc)
 	day := bh.Days[int(now.Weekday())]
@@ -759,8 +793,21 @@ func businessHoursHint(bh *models.BusinessHours) string {
 		"Answer confidently from the schedule above — do NOT say you don't know."
 
 	// ── OPEN right now ───────────────────────────────────────────────
+	// Two cases (times are "HH:MM" strings, compared lexically which is safe
+	// for zero-padded 24h times):
+	//   • Same-day range (Open <= Close): open when Open <= now < Close.
+	//   • Overnight range (Open > Close, e.g. 22:00–06:00): open when
+	//     now >= Open (this evening) OR now < Close (early tomorrow).
 	currentHM := now.Format("15:04")
-	if day.Enabled && currentHM >= day.Open && currentHM < day.Close {
+	openNow := false
+	if day.Enabled {
+		if day.Open <= day.Close {
+			openNow = currentHM >= day.Open && currentHM < day.Close
+		} else {
+			openNow = currentHM >= day.Open || currentHM < day.Close
+		}
+	}
+	if openNow {
 		return scheduleBlock + "\n\n" +
 			"Current status: OPEN now (until " + day.Close + " " + bh.Timezone + "). " +
 			"Answer the customer normally."
@@ -1038,6 +1085,11 @@ func (h *PlaygroundHandler) ListConversations(c *fiber.Ctx) error {
 
 // ── Monthly quota helpers ─────────────────────────────────────────────────────
 
+// quotaFallbackMessagesPerMonth is the safe cap applied when a tenant's plan
+// document can't be found/decoded. It mirrors the seeded "free" plan limit so a
+// mis-configured tenant is never treated as unlimited.
+const quotaFallbackMessagesPerMonth = 200
+
 // checkMonthlyQuota returns (true, upgradeMessage) when the tenant has
 // consumed more inbound messages this calendar month than their plan allows.
 // Returns (false, "") when the tenant is within limits or has an unlimited plan.
@@ -1054,11 +1106,15 @@ func (o *Orchestrator) checkMonthlyQuota(ctx context.Context, tenant models.Tena
 	}
 	if err := o.mongo.DB.Collection("plans").
 		FindOne(tctx, bson.M{"_id": tenant.Plan}).Decode(&plan); err != nil {
-		return false, "" // unknown plan → don't block
+		// Unknown/missing plan doc must NOT be treated as unlimited — that would
+		// let a mis-configured tenant send without any cap. Fall back to the
+		// safe free-plan limit and keep enforcing. sort_order stays 0 (free),
+		// which is fine for the "next plan" lookup below.
+		plan.Limits.MessagesPerMonth = quotaFallbackMessagesPerMonth
 	}
 	limit := plan.Limits.MessagesPerMonth
 	if limit == -1 {
-		return false, "" // unlimited plan
+		return false, "" // unlimited plan (real plans keep their existing semantics)
 	}
 
 	// Count inbound (user-role) messages on real channels this calendar month.

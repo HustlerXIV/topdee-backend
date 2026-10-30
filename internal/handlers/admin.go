@@ -23,6 +23,7 @@ package handlers
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"time"
 
@@ -426,12 +427,25 @@ func (h *AdminHandler) ExtendSubscription(c *fiber.Ctx) error {
 // DELETE /api/v1/admin/tenants/:id — cascade.
 //
 // Also removes users, knowledge bases, messages, team invites tied to the
-// tenant. The Qdrant vectors are NOT deleted here (the AI service owns
-// that lifecycle); this is a best-effort cleanup of the Mongo side.
+// tenant. This is a best-effort cleanup of the Mongo side.
+//
+// KNOWN LIMITATION (M6 / Qdrant orphan cleanup): the Qdrant vectors backing
+// this tenant's knowledge bases are NOT deleted here because AdminHandler is
+// not wired with an AI client (see the struct above — it only holds *db.Mongo).
+// The per-KB delete path in agents.go uses h.ai.DeleteKnowledgeBase(ctx,
+// tenantID, kbID) to remove vectors; the equivalent cleanup should be done
+// here once an AI client is available on AdminHandler. Doing that now would
+// require adding the field and updating NewAdminHandler's call site in main.go,
+// which is out of scope for this change. Until then, deleting a tenant orphans
+// its Qdrant vectors. See the loop below where knowledge_bases are removed.
 func (h *AdminHandler) DeleteTenant(c *fiber.Ctx) error {
 	id := c.Params("id")
 	ctx := c.Context()
 
+	// TODO(M6): before deleting the knowledge_bases documents below, load each
+	// KB for this tenant and best-effort call ai.DeleteKnowledgeBase(ctx, id,
+	// kb.ID) (logging, not failing, on error) once AdminHandler has an AI
+	// client. The Mongo-side cascade continues regardless.
 	for _, coll := range []string{"users", "knowledge_bases", "messages", "team_invites"} {
 		_, _ = h.mongo.DB.Collection(coll).DeleteMany(ctx, bson.M{"tenant_id": id})
 	}
@@ -739,7 +753,7 @@ func (h *AdminHandler) DeletePlan(c *fiber.Ctx) error {
 	)
 	if count > 0 {
 		return fiber.NewError(fiber.StatusConflict,
-			"cannot delete: "+string(rune('0'+count))+" tenant(s) are on this plan")
+			fmt.Sprintf("cannot delete: %d tenant(s) are on this plan", count))
 	}
 	res, err := h.mongo.DB.Collection("plans").DeleteOne(c.Context(), bson.M{"_id": id})
 	if err != nil {

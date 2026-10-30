@@ -18,12 +18,18 @@ import (
 
 // Client is one connected dashboard tab. Outbound writes go through `send`
 // so the broadcast loop never blocks on a slow socket.
+//
+// `send` is intentionally NEVER closed: closing it would race with the
+// broadcaster (which holds a snapshot reference to this Client and sends
+// outside the hub lock), and sending on a closed channel panics — taking
+// down the whole process. Teardown is signalled purely via `closed`.
 type Client struct {
 	Conn     *ws.Conn
 	TenantID string
 	UserID   string
 	send     chan []byte
 	closed   chan struct{}
+	once     sync.Once
 }
 
 // Hub fans out messages to every Client subscribed to a given tenant id.
@@ -46,20 +52,19 @@ func (h *Hub) Add(c *Client) {
 	h.clients[c.TenantID][c] = struct{}{}
 }
 
-// Remove unregisters a client and closes its send channel so the writer
-// goroutine exits cleanly.
+// Remove unregisters a client and signals its writer goroutine to exit.
+// It does NOT close `send` (see the Client doc comment) — the writer exits
+// on the `closed` signal instead, which cannot race with Broadcast.
 func (h *Hub) Remove(c *Client) {
 	h.mu.Lock()
-	defer h.mu.Unlock()
 	if set, ok := h.clients[c.TenantID]; ok {
-		if _, has := set[c]; has {
-			delete(set, c)
-			close(c.send)
-		}
+		delete(set, c)
 		if len(set) == 0 {
 			delete(h.clients, c.TenantID)
 		}
 	}
+	h.mu.Unlock()
+	c.SignalClose()
 }
 
 // Broadcast marshals `payload` once and pushes it onto every subscriber's
@@ -82,7 +87,12 @@ func (h *Hub) Broadcast(tenantID string, payload any) {
 	h.mu.RUnlock()
 
 	for _, c := range targets {
+		// `closed` takes priority: if the client is tearing down we skip it
+		// entirely. Because `send` is never closed, the send case can never
+		// panic — at worst it hits `default` and the message is dropped.
 		select {
+		case <-c.closed:
+			// client is shutting down; skip
 		case c.send <- msg:
 		default:
 			log.Printf("realtime: drop slow client tenant=%s", c.TenantID)
@@ -108,14 +118,9 @@ func (c *Client) Send() <-chan []byte { return c.send }
 // dropped connection.
 func (c *Client) Closed() <-chan struct{} { return c.closed }
 
-// SignalClose is called once by the reader goroutine when the connection
-// drops, so the writer can exit. Safe to call multiple times because we
-// guard with a sync.Once via the Hub's Remove path closing `send`.
+// SignalClose closes the `closed` channel so the writer goroutine exits.
+// Called from both the reader goroutine (on disconnect) and Hub.Remove;
+// sync.Once makes it safe to call concurrently and repeatedly.
 func (c *Client) SignalClose() {
-	select {
-	case <-c.closed:
-		// already closed
-	default:
-		close(c.closed)
-	}
+	c.once.Do(func() { close(c.closed) })
 }

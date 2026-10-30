@@ -5,6 +5,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 	_ "time/tzdata" // embed IANA timezone database so Alpine containers work
@@ -83,7 +84,21 @@ func main() {
 	})
 	app.Use(recover.New())
 	app.Use(logger.New())
+	// Public widget API is embedded on arbitrary tenant websites, so it must
+	// accept any origin regardless of CORS_ALLOW_ORIGINS. Registered before the
+	// global CORS middleware so it answers the preflight first. No cookies/JWT
+	// are used here (widget_id is the credential), so "*" is safe.
+	app.Use("/widget", cors.New(cors.Config{
+		AllowOrigins: "*",
+		AllowHeaders: "Origin, Content-Type, Accept",
+		AllowMethods: "GET, POST, OPTIONS",
+	}))
 	app.Use(cors.New(cors.Config{
+		// /widget/* is handled by the permissive CORS above; skip here so this
+		// stricter config can't overwrite its headers.
+		Next: func(c *fiber.Ctx) bool {
+			return strings.HasPrefix(c.Path(), "/widget/")
+		},
 		AllowOrigins: cfg.AllowOrigins,
 		AllowHeaders: "Origin, Content-Type, Accept, Authorization",
 		AllowMethods: "GET, POST, PUT, PATCH, DELETE, OPTIONS",

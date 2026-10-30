@@ -63,6 +63,9 @@ func (h *AuthHandler) Register(c *fiber.Ctx) error {
 	if err := c.BodyParser(&req); err != nil {
 		return fiber.NewError(fiber.StatusBadRequest, "invalid body")
 	}
+	// Normalize email to lowercase+trimmed so registration, login, and all
+	// other flows store/query it consistently (prevents duplicate accounts).
+	req.Email = strings.ToLower(strings.TrimSpace(req.Email))
 	if req.TenantName == "" || req.Email == "" || len(req.Password) < 8 {
 		return fiber.NewError(fiber.StatusBadRequest, "tenant_name, email, password (>=8) required")
 	}
@@ -178,9 +181,22 @@ func (h *AuthHandler) processReferralSignup(newTenantID, newUserID, code, tenant
 		// Invalid code — silently ignore.
 		return
 	}
-	// Prevent self-referral.
+	// Prevent self-referral within the same tenant.
 	if refCode.TenantID == newTenantID {
 		return
+	}
+	// Prevent self-referral across tenants: reject if the code's owner has the
+	// same email as the registering user (case-insensitive). A user must not be
+	// able to refer themselves by signing up a second tenant.
+	var referrerUser, newUser models.User
+	if err := h.mongo.DB.Collection("users").
+		FindOne(ctx, bson.M{"_id": refCode.UserID}).Decode(&referrerUser); err == nil {
+		if err := h.mongo.DB.Collection("users").
+			FindOne(ctx, bson.M{"_id": newUserID}).Decode(&newUser); err == nil {
+			if strings.EqualFold(strings.TrimSpace(referrerUser.Email), strings.TrimSpace(newUser.Email)) {
+				return
+			}
+		}
 	}
 
 	// Stamp discount on the new tenant.
@@ -315,6 +331,8 @@ func (h *AuthHandler) ForgotPassword(c *fiber.Ctx) error {
 	if err := c.BodyParser(&req); err != nil || req.Email == "" {
 		return fiber.NewError(fiber.StatusBadRequest, "email required")
 	}
+	// Normalize email so the lookup matches accounts stored lowercased.
+	req.Email = strings.ToLower(strings.TrimSpace(req.Email))
 
 	// Look up the user — tell them explicitly if not found.
 	var u models.User
@@ -419,6 +437,8 @@ func (h *AuthHandler) Login(c *fiber.Ctx) error {
 	if err := c.BodyParser(&req); err != nil {
 		return fiber.NewError(fiber.StatusBadRequest, "invalid body")
 	}
+	// Normalize email so login matches accounts stored lowercased.
+	req.Email = strings.ToLower(strings.TrimSpace(req.Email))
 	var u models.User
 	err := h.mongo.DB.Collection("users").
 		FindOne(c.Context(), bson.M{"email": req.Email}).Decode(&u)

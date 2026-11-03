@@ -173,7 +173,7 @@ func (h *GoogleAuthHandler) fetchGoogleProfile(code string) (*googleProfile, err
 	}
 
 	// Fetch profile with the access token.
-	req, _ := http.NewRequest("GET", "https://www.googleapis.com/oauth2/v2/userinfo", nil)
+	req, _ := http.NewRequest("GET", "https://openidconnect.googleapis.com/v1/userinfo", nil)
 	req.Header.Set("Authorization", "Bearer "+tokenResp.AccessToken)
 	profileResp, err := http.DefaultClient.Do(req)
 	if err != nil {
